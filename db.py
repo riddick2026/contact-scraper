@@ -137,8 +137,9 @@ def connect(cfg: DbConfig, wait_for_resume: float = 90):
         try:
             return mssql_python.connect(conn_str)
         except Exception as exc:  # noqa: BLE001 - driver raises several types
-            # 40613: database is resuming from auto-pause; it'll accept connections shortly
-            if ("40613" in str(exc) or "not currently available" in str(exc)) and time.monotonic() < deadline:
+            # A database resuming from auto-pause refuses (40613) or times out until it's ready
+            waking = any(s in str(exc) for s in ("40613", "not currently available", "Timeout"))
+            if waking and time.monotonic() < deadline:
                 time.sleep(5)
                 continue
             raise DbError(_friendly(exc)) from exc
@@ -377,11 +378,13 @@ def _label(row: dict) -> str:
 
 
 def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, dict],
-                  inserts: list[dict], deletes: list[int], names: dict[int, str] | None = None) -> ChangeResult:
+                  inserts: list[dict], deletes: list[int], names: dict[int, str] | None = None,
+                  editor: str | None = None) -> ChangeResult:
     """Write viewer edits in one transaction.
 
     Updates and deletes only apply if the row hasn't changed since it was loaded (its
-    RowVer still matches); otherwise they're skipped and reported as conflicts.
+    RowVer still matches); otherwise they're skipped and reported as conflicts. `editor` is
+    recorded as LastEditedBy; without it, the database login name is used.
     """
     result = ChangeResult(conflicts=[])
     names = names or {}
@@ -397,8 +400,8 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
             assignments = ", ".join(f"{c} = ?" for c in sets)
             cur.execute(
                 f"UPDATE dbo.Vendors SET {assignments}, LastEdited = SYSUTCDATETIME(), "
-                "LastEditedBy = SUSER_SNAME() WHERE Id = ? AND RowVer = ?",
-                [*sets.values(), row_id, versions[row_id]],
+                "LastEditedBy = COALESCE(?, SUSER_SNAME()) WHERE Id = ? AND RowVer = ?",
+                [*sets.values(), editor, row_id, versions[row_id]],
             )
             if cur.rowcount == 1:
                 result.updated += 1
@@ -424,8 +427,8 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
             cols = [*FIELDS, "Notes", "LastEdited", "LastEditedBy"]
             cur.execute(
                 f"INSERT INTO dbo.Vendors ({', '.join(cols)}) "
-                f"VALUES ({', '.join('?' * (len(FIELDS) + 1))}, SYSUTCDATETIME(), SUSER_SNAME())",
-                [*(rec[f] for f in FIELDS), _text(row.get("Notes"))],
+                f"VALUES ({', '.join('?' * (len(FIELDS) + 1))}, SYSUTCDATETIME(), COALESCE(?, SUSER_SNAME()))",
+                [*(rec[f] for f in FIELDS), _text(row.get("Notes")), editor],
             )
             result.inserted += 1
         conn.commit()

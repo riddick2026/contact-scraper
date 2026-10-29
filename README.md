@@ -106,6 +106,30 @@ The app's error message shows the exact IP Azure saw. Use that one: with the **A
 
 The database uses Azure SQL's free offer (100,000 vCore-seconds of compute and 32 GB of storage per month). It auto-pauses when idle and when the monthly free allowance is used up, so it doesn't bill. After a pause, the first save or connection takes up to a minute while it wakes.
 
+## Hosted version
+
+The whole app (scraper and Database viewer) also runs on Azure at **https://contact-scraper-4b54ea.azurewebsites.net**, so you can use it from any device without installing anything.
+
+- **Sign-in:** Microsoft sign-in is required. Anyone in the `Default Directory` tenant (members and guests) can open it; nobody gets in anonymously. Viewer edits are recorded under the signed-in person's name.
+- **Database access:** the web app signs in to Azure SQL with its own managed identity (`contact-scraper-4b54ea`, read/write only), so no password is stored. Its outbound IPs are allowed in the SQL firewall (`webapp-…` rules).
+- **Plan:** App Service **Basic B1** (Linux, West US 3), about $13/month, covered by the Visual Studio subscription's monthly Azure credit (which has a spending limit). Always On is enabled, so the site doesn't sleep. The free F1 tier was tried first but can't install the app's packages within its CPU limit.
+
+- **Scraping from Azure:** some websites and search engines block data-centre IPs, so the hosted scraper may find fewer websites than running it on your own computer.
+
+### Deploy an update
+
+After pushing changes to GitHub, redeploy from a clone of the repo:
+
+```bash
+git ls-files | zip -q /tmp/deploy.zip -@ && az webapp deploy -g rg-contact-scraper -n contact-scraper-4b54ea --src-path /tmp/deploy.zip --type zip
+```
+
+Azure installs `requirements.txt` during the deploy. App settings (`AZURE_SQL_SERVER`, `AZURE_SQL_DATABASE`, the sign-in secret) live in the web app's configuration, not in the repo.
+
+### Give someone access
+
+Anyone in the directory can already sign in. To restrict it to named people, in the Azure portal open **Microsoft Entra ID → Enterprise applications → Contact Scraper → Properties**, set **Assignment required** to Yes, then add people under **Users and groups**.
+
 ## Optional: better name detection
 
 Install spaCy and its English model; the scraper uses it automatically when present.

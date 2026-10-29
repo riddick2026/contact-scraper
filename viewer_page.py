@@ -55,6 +55,11 @@ def _norm(value) -> str:
     return str(value).strip()
 
 
+def signed_in_user() -> str | None:
+    """The person signed in through App Service authentication, when hosted on Azure."""
+    return st.context.headers.get("X-Ms-Client-Principal-Name")
+
+
 def load() -> None:
     with st.spinner("Loading records… (a paused database can take up to a minute to wake)"):
         df, versions = db.load_vendors(cfg)
@@ -128,7 +133,9 @@ if msg := st.session_state.pop("viewer_message", None):
     getattr(st, msg[0])(msg[1])
 
 top = st.columns([3, 1])
-top[0].caption(f"**{cfg.label}** · {len(df_all)} records · loaded {data['loaded']:%H:%M:%S}")
+user = signed_in_user()
+top[0].caption(f"**{cfg.label}** · {len(df_all)} records · loaded {data['loaded']:%H:%M:%S}"
+               + (f" · signed in as {user}" if user else ""))
 if top[1].button("🔄 Reload", width="stretch", help="Fetch the latest data (discards unsaved edits)."):
     try:
         load()
@@ -192,7 +199,7 @@ if actions.button("💾 Save changes", type="primary", disabled=not pending or n
         with st.spinner("Saving…"):
             names = {int(r.Id): _norm(r.VendorName) or _norm(r.Website) for r in view.itertuples()}
             res = db.apply_changes(cfg, data["versions"], updates, inserts,
-                                   deletes if confirm_delete else [], names)
+                                   deletes if confirm_delete else [], names, editor=user)
         done = ", ".join(f"{n} {label}" for n, label in ((res.updated, "updated"), (res.inserted, "added"),
                                                           (res.deleted, "deleted")) if n) or "nothing changed"
         if res.conflicts:
