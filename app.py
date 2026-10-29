@@ -16,7 +16,7 @@ import streamlit as st
 
 from scraper import ScrapeResult, scrape_url
 
-COLUMNS = ["URL", "Status", "Emails", "Phone Numbers", "Contact Names", "Pages Scraped"]
+COLUMNS = ["URL", "Status", "Emails", "Phone Numbers", "Contact Names", "Insurance or Bond", "Pages Scraped"]
 
 st.set_page_config(page_title="Contact Scraper", page_icon="🔎", layout="wide")
 
@@ -108,8 +108,9 @@ if "results" not in st.session_state:
 
 st.title("🔎 Contact Info Scraper")
 st.caption(
-    "Paste website URLs (one per line). Each homepage is scanned for emails, phone numbers and "
-    "contact names; if none are found, one Contact/About page on the same domain is checked."
+    "Paste website URLs (one per line). Each homepage is scanned for emails, phone numbers, "
+    "contact names and insurance/bond/licence details; if contact or insurance info is missing, "
+    "a Contact, Licensing or About page on the same domain is checked."
 )
 
 with st.sidebar:
@@ -153,11 +154,12 @@ if results:
     df = pd.DataFrame(results, columns=COLUMNS)
     table_slot.dataframe(style_status(df), width="stretch", hide_index=True)
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Sites", len(df))
     m2.metric("With emails", int((df["Emails"] != "").sum()))
     m3.metric("With phones", int((df["Phone Numbers"] != "").sum()))
-    m4.metric("Errors", int((~df["Status"].str.startswith("OK")).sum()))
+    m4.metric("With insurance/bond", int((df["Insurance or Bond"] != "Unknown").sum()))
+    m5.metric("Errors", int((~df["Status"].str.startswith("OK")).sum()))
 
     st.download_button(
         "📥 Download to Excel",

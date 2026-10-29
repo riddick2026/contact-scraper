@@ -111,6 +111,68 @@ NAME_STOPWORDS = {
 
 CONTACT_LINK_RE = re.compile(r"contact|get[\s_-]?in[\s_-]?touch|reach[\s_-]?us|kontakt|contacto", re.I)
 ABOUT_LINK_RE = re.compile(r"about|team|who[\s_-]?we[\s_-]?are|our[\s_-]?story|impressum", re.I)
+INSURANCE_LINK_RE = re.compile(r"licen[cs]|insur|bond|credential|accredit|certification", re.I)
+INSURANCE_FALLBACK_LINK_RE = re.compile(r"about|why[\s_-]?(?:choose|us)|who[\s_-]?we[\s_-]?are|our[\s_-]?company", re.I)
+
+# --------------------------------------------------------------------------- #
+# Insurance / bond / licence heuristics
+# --------------------------------------------------------------------------- #
+
+INSURANCE_UNKNOWN = "Unknown"
+
+_LBI = r"(licensed|bonded|insured)"
+_JOIN = r"\s*(?:,|&|\+|/|\band\b)?\s*(?:fully\s+)?"
+# "Licensed, Bonded & Insured", "fully insured", "Bonded and Insured"
+INSURANCE_STATUS_RE = re.compile(
+    rf"\b((?:fully|properly)\s+)?{_LBI}(?:{_JOIN}{_LBI})?(?:{_JOIN}{_LBI})?\b", re.I
+)
+# A lone "licensed"/"insured" only counts when it is clearly about the business
+_STATUS_BEFORE = re.compile(r"(?:\bwe\s+are|\bwe'?re|\bwe’re|\bare|\bis|\bcompany|\bbusiness)\s*$", re.I)
+_STATUS_AFTER = re.compile(
+    r"^\s+(?:and\s+\w+\s+)?(?:\w+\s+)?(?:contractors?|company|business|professionals?|technicians?|"
+    r"plumbers?|electricians?|roofers?|movers?|team|crews?|staff|installers?|pros?|experts?|"
+    r"specialists?|tradesmen|in\s+(?:the\s+)?(?:state|texas|[A-Z][a-z]+))\b",
+    re.I,
+)
+
+# Licence / registration / bond numbers: "TX License #TACLA12345C", "Lic. No: 123456",
+# "Bond #SB-99812", "Registration Number: 4471", "USDOT 1234567"
+_ID = r"([A-Z0-9][A-Z0-9-]{2,19})"
+LICENSE_LABELED_RE = re.compile(
+    r"(?:\b(?:[A-Z]{2,5})\s+)?"                                        # TX, TDLR, CSLB
+    r"(?i:(?:state\s+|contractor'?s?\s+|master\s+|electrical\s+|plumbing\s+|hvac\s+|business\s+)?"
+    r"(?:licen[cs]e|lic\.?|registration|reg\.?|bond|insurance\s+policy)"
+    r"\s*(?:no\.?|number|num\.?|#|:)\s*[:.#]?\s*)"
+    + _ID
+)
+LICENSE_PREFIX_RE = re.compile(
+    r"\b(?:TACLA|TECL|RMP|TDLR|CSLB|ROC)\s*[#:-]?\s*\d{3,8}[A-Z]?\b"
+    r"|\b(?:US\s?DOT|USDOT)\s*(?:No\.?|#|Number)?\s*:?\s*\d{4,8}\b"
+    r"|\bMC\s*(?:No\.?|#|Number)\s*:?\s*\d{5,8}\b"
+)
+
+COVERAGE_PATTERNS = [
+    ("General liability insurance", re.compile(r"\bgeneral\s+liability\b", re.I)),
+    ("Liability insurance", re.compile(
+        r"\b(?:business|public|commercial)\s+liability\b|\bliability\s+(?:insurance|coverage)\b", re.I)),
+    ("Professional liability (E&O)", re.compile(
+        r"\bprofessional\s+liability\b|\berrors\s+(?:and|&)\s+omissions\b", re.I)),
+    ("Workers' compensation", re.compile(r"\bworkers?['’]?s?['’]?\s+comp(?:ensation)?\b", re.I)),
+    ("Surety bond", re.compile(
+        r"\bsurety\s+bond(?:ed)?\b|\b(?:license|contractor['’]?s?|performance|payment)\s+bond\b", re.I)),
+    ("Certificate of insurance", re.compile(r"\bcertificates?\s+of\s+insurance\b", re.I)),
+]
+_MONEY = r"\$\s?\d[\d,]*(?:\.\d+)?(?:\s?(?:million|mil|M|K)\b)?"
+COVERAGE_AMOUNT_RES = [
+    re.compile(rf"({_MONEY})\s+(?:in\s+|of\s+)?(?:general\s+)?(?:liability|insurance|coverage|bond)", re.I),
+    re.compile(rf"\b(?:insured|coverage|liability|bonded)\s+(?:up\s+to|for|of|to)\s+({_MONEY})", re.I),
+]
+# Mentions of *customers'* insurance (claims, adjusters) or legal services, not the provider's
+COVERAGE_EXCLUDE_RE = re.compile(
+    r"claims?\b|adjuster|deductible|accept\w*\s+(?:all\s+)?insurance|insurance\s+(?:compan|carrier|provider|work|job)|"
+    r"lawyer|attorney|law\s+firm|injur|lawsuit",
+    re.I,
+)
 
 # Optional NLP: use spaCy NER if the user has it installed, otherwise patterns only.
 try:  # pragma: no cover - optional dependency
@@ -132,10 +194,24 @@ class ScrapeResult:
     emails: set[str] = field(default_factory=set)
     phones: set[str] = field(default_factory=set)
     names: set[str] = field(default_factory=set)
+    insurance_terms: set[str] = field(default_factory=set)        # licensed / bonded / insured
+    insurance_details: dict[str, None] = field(default_factory=dict)  # ordered set of findings
     pages_scraped: list[str] = field(default_factory=list)
 
     def has_contact_info(self) -> bool:
         return bool(self.emails or self.phones)
+
+    def has_insurance_info(self) -> bool:
+        return bool(self.insurance_terms or self.insurance_details)
+
+    def insurance_summary(self) -> str:
+        order = ["Licensed", "Bonded", "Insured"]
+        terms = [t for t in order if t.lower() in self.insurance_terms]
+        parts = []
+        if terms:
+            parts.append(terms[0] if len(terms) == 1 else ", ".join(terms[:-1]) + " & " + terms[-1])
+        parts.extend(self.insurance_details)
+        return "; ".join(parts[:10]) or INSURANCE_UNKNOWN
 
     def as_row(self) -> dict:
         return {
@@ -144,6 +220,7 @@ class ScrapeResult:
             "Emails": ", ".join(sorted(self.emails)),
             "Phone Numbers": ", ".join(sorted(self.phones)),
             "Contact Names": ", ".join(sorted(self.names)),
+            "Insurance or Bond": self.insurance_summary(),
             "Pages Scraped": " | ".join(self.pages_scraped),
         }
 
@@ -315,6 +392,56 @@ def extract_names(soup: BeautifulSoup, text: str) -> set[str]:
     return {n for n in (_valid_name(c) for c in candidates) if n}
 
 
+def _normalize_money(raw: str) -> str:
+    raw = re.sub(r"\s+", " ", raw.strip())
+    return re.sub(r"\s?(mil|M)\b$", " million", re.sub(r"\s?K\b$", "K", raw))
+
+
+def extract_insurance(text: str) -> tuple[set[str], list[str]]:
+    """Return ({licensed/bonded/insured}, [licence numbers, coverage types, amounts])."""
+    flat = re.sub(r"\s+", " ", text)
+    terms: set[str] = set()
+    details: list[str] = []
+
+    def add(item: str) -> None:
+        if item not in details:
+            details.append(item)
+
+    for m in INSURANCE_STATUS_RE.finditer(flat):
+        words = {w.lower() for w in m.groups()[1:] if w}
+        before, after = flat[max(0, m.start() - 25):m.start()], flat[m.end():m.end() + 40]
+        if len(words) >= 2 or m.group(1) or _STATUS_BEFORE.search(before) or _STATUS_AFTER.search(after):
+            terms |= words
+
+    # Licence / registration / bond numbers, de-duplicated by the ID itself
+    seen_ids: set[str] = set()
+    for m in [*LICENSE_LABELED_RE.finditer(flat), *LICENSE_PREFIX_RE.finditer(flat)]:
+        snippet = re.sub(r"\s+", " ", m.group(0)).strip(" :.")
+        ident = m.group(1) if m.re is LICENSE_LABELED_RE else re.sub(r"\D", "", snippet)
+        if not re.search(r"\d", ident):
+            continue
+        key = re.sub(r"[^0-9A-Z]", "", ident.upper())
+        if any(key in s or s in key for s in seen_ids):
+            continue
+        seen_ids.add(key)
+        add(snippet)
+
+    for label, pattern in COVERAGE_PATTERNS:
+        for m in pattern.finditer(flat):
+            window = flat[max(0, m.start() - 80):m.end() + 80]
+            if not COVERAGE_EXCLUDE_RE.search(window):
+                add(label)
+                break
+
+    for pattern in COVERAGE_AMOUNT_RES:
+        for m in pattern.finditer(flat):
+            window = flat[max(0, m.start() - 80):m.end() + 80]
+            if not COVERAGE_EXCLUDE_RE.search(window):
+                add(f"Coverage: {_normalize_money(m.group(1))}")
+
+    return terms, details
+
+
 def _visible_text(soup: BeautifulSoup) -> str:
     for tag in soup(["script", "style", "noscript", "template", "svg"]):
         tag.decompose()
@@ -346,6 +473,27 @@ def find_contact_link(soup: BeautifulSoup, base_url: str) -> str | None:
     return contact or about
 
 
+def find_insurance_link(soup: BeautifulSoup, base_url: str, skip: list[str]) -> str | None:
+    """Return a licensing/insurance page on the same domain, falling back to 'About'."""
+    skip_norm = {s.rstrip("/") for s in skip}
+    best, fallback = None, None
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        absolute = urljoin(base_url, href).split("#", 1)[0]
+        if not _same_domain(absolute, base_url) or absolute.rstrip("/") in skip_norm \
+                or absolute.rstrip("/") == base_url.rstrip("/"):
+            continue
+        label = f"{a.get_text(' ', strip=True)} {href}"
+        if INSURANCE_LINK_RE.search(label):
+            best = absolute
+            break
+        if fallback is None and INSURANCE_FALLBACK_LINK_RE.search(label):
+            fallback = absolute
+    return best or fallback
+
+
 # --------------------------------------------------------------------------- #
 # Fetch + scrape
 # --------------------------------------------------------------------------- #
@@ -368,6 +516,10 @@ def _scrape_page(result: ScrapeResult, url: str, html: str) -> BeautifulSoup:
     result.emails |= extract_emails(link_soup, text)
     result.phones |= extract_phones(link_soup, text)
     result.names |= extract_names(link_soup, text)
+    terms, details = extract_insurance(text)
+    result.insurance_terms |= terms
+    for item in details:
+        result.insurance_details.setdefault(item, None)
     result.pages_scraped.append(url)
     return link_soup
 
@@ -411,6 +563,16 @@ def scrape_url(raw_url: str) -> ScrapeResult:
                         _scrape_page(result, sub_url, sub_html)
                     except requests.exceptions.RequestException:
                         result.status = "OK (contact page failed to load)"
+
+            # Insurance/licence claims often live on an About or Licensing page
+            if not result.has_insurance_info():
+                follow = find_insurance_link(soup, final_url, result.pages_scraped)
+                if follow:
+                    try:
+                        sub_url, sub_html = fetch(session, follow)
+                        _scrape_page(result, sub_url, sub_html)
+                    except requests.exceptions.RequestException:
+                        pass  # optional page; homepage results still stand
         except Exception as exc:  # noqa: BLE001 - parsing problems shouldn't crash the app
             result.status = f"Parse Error: {type(exc).__name__}"
             return result
