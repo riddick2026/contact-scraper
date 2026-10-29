@@ -1,0 +1,13 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local tooling
+.claude/
+.streamlit/secrets.toml
+.DS_Store
+
+# Exported results
+*.xlsx
