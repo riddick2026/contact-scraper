@@ -6,6 +6,9 @@ pandas>=2.1
 openpyxl>=3.1
 xlrd>=2.0
 ddgs>=9.5
+# Azure SQL storage (Microsoft's driver; no separate ODBC install needed)
+mssql-python>=1.0
+azure-identity>=1.19
 # Optional: better contact-name detection via NER
 # spacy>=3.7
 # then: python -m spacy download en_core_web_sm

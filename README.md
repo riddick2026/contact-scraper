@@ -53,6 +53,48 @@ On Windows, just double-click `run.bat`. Otherwise:
 
 Then open http://localhost:8501.
 
+## Saving to Azure SQL
+
+Both modes have a **💾 Save to Azure SQL** button. Results go into one table, `dbo.Vendors`, with one row per vendor (spreadsheet mode) or per website (pasted URLs). Saving again **updates** the existing row instead of adding a duplicate:
+
+- A newly scraped real value replaces the stored one; a gap marker (`Not found`, `Unknown`, `Site unreachable`…) never overwrites a real stored value.
+- A pasted URL updates the vendor row that already has that website, if exactly one does.
+- Other spreadsheet columns are kept as JSON in `ExtraData`. `FirstSeen` / `LastScraped` are tracked, and `Notes`, `LastEdited`, `LastEditedBy` are reserved for the viewer.
+
+The app signs in with your Microsoft Entra ID account through the Azure CLI, so no database password is stored anywhere.
+
+### Set up a computer
+
+1. Install the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) and sign in (your tenant requires MFA, so name it):
+
+   ```bash
+   az login --tenant dc5bdcf9-e0ad-4ace-a592-43c245b439fe
+   ```
+
+2. Create `.streamlit/secrets.toml` (it's git-ignored, so it isn't synced):
+
+   ```toml
+   [azure_sql]
+   server = "contact-scraper-4b54ea.database.windows.net"
+   database = "ContactScraper"
+   ```
+
+3. Use **Test connection** in the sidebar.
+
+### Allow a new network
+
+Azure SQL only accepts connections from allowed IP addresses. On a new network (another office, home, a laptop elsewhere), the app says the firewall is blocking it. Allow your current IP with:
+
+```bash
+az sql server firewall-rule create -g rg-contact-scraper -s contact-scraper-4b54ea -n "client-$(curl -s https://api.ipify.org | tr . -)" --start-ip-address "$(curl -s https://api.ipify.org)" --end-ip-address "$(curl -s https://api.ipify.org)"
+```
+
+The app's error message shows the exact IP Azure saw. Use that one: with the **Azure VPN Client** connected, SQL traffic leaves through the VPN gateway's shared IPs (rules `azvpn-…` already allow the ones seen so far), not your network's public IP, so a lookup site like ipify would give the wrong answer.
+
+### Cost
+
+The database uses Azure SQL's free offer (100,000 vCore-seconds of compute and 32 GB of storage per month). It auto-pauses when idle and when the monthly free allowance is used up, so it doesn't bill. After a pause, the first save or connection takes up to a minute while it wakes.
+
 ## Optional: better name detection
 
 Install spaCy and its English model; the scraper uses it automatically when present.
@@ -66,4 +108,5 @@ Install spaCy and its English model; the scraper uses it automatically when pres
 
 - `app.py`: Streamlit UI (spreadsheet + URL modes, progress, results, exports)
 - `enrich.py`: spreadsheet loading (CSV/Excel/Google Sheets), website search, row enrichment, colour-coded Excel export
+- `db.py`: Azure SQL storage (connection, `dbo.Vendors` table, save/update logic)
 - `scraper.py`: scraping engine (fetching, link following, email/phone/name extraction)

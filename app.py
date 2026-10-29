@@ -15,6 +15,7 @@ from typing import Callable
 import pandas as pd
 import streamlit as st
 
+import db
 import enrich
 from scraper import INSURANCE_UNKNOWN, ScrapeResult, scrape_url
 
@@ -116,6 +117,16 @@ def cached_load_file(name: str, data: bytes) -> dict[str, pd.DataFrame]:
     return enrich.load_file(name, data)
 
 
+def save_to_db(slot, records: list[dict]) -> None:
+    """Upsert records into Azure SQL, reporting the outcome in `slot`."""
+    try:
+        with st.spinner("Saving to Azure SQL… (a paused database can take up to a minute to wake)"):
+            counts = db.save_records(db_cfg, records)
+        slot.success(f"💾 Saved to {db_cfg.label}: {counts['inserted']} new, {counts['updated']} updated")
+    except db.DbError as exc:
+        slot.error(f"Couldn't save to Azure SQL: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
@@ -147,6 +158,25 @@ with st.sidebar:
                     st.caption(h["url"])
             except enrich.SearchError as exc:
                 st.error(f"Search failed: {exc}")
+    st.divider()
+    st.subheader("Azure SQL")
+    try:
+        db_cfg = db.load_config()
+    except db.DbError as exc:
+        db_cfg = None
+        st.error(str(exc))
+    if db_cfg is None:
+        st.caption("Not set up. Add an `[azure_sql]` section to `.streamlit/secrets.toml` "
+                   "(see the README) to enable saving results.")
+    else:
+        st.caption(f"Saving to **{db_cfg.label}**")
+        if st.button("Test connection"):
+            try:
+                with st.spinner("Connecting… (a paused database can take up to a minute to wake)"):
+                    st.success(db.test_connection(db_cfg))
+            except db.DbError as exc:
+                st.error(str(exc))
+    st.divider()
     if st.button("Clear results"):
         st.session_state.results = []
         st.session_state.enriched = None
@@ -264,7 +294,7 @@ with tab_sheet:
                 enrich.flag_shared_sites(rows, mapping, vendor_col)
                 st.session_state.enriched = {
                     "df": pd.DataFrame(rows, columns=columns), "mapping": mapping, "key": run_key,
-                    "name": base_name, "sheet": sheet_name,
+                    "name": base_name, "sheet": sheet_name, "vendor_col": vendor_col,
                 }
                 sheet_status.success(f"✅ Done — {len(rows)} vendors in {time.perf_counter() - t0:.1f}s")
 
@@ -290,18 +320,23 @@ with tab_sheet:
                 m[5].metric("With insurance/bond", count_real(enrich.OUT_INSURANCE))
 
                 stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-                d1, d2, _ = st.columns([1.5, 1, 2.5])
-                d1.download_button(
+                sheet_buttons = st.container(horizontal=True)
+                sheet_buttons.download_button(
                     "📥 Download Excel (color-coded)",
                     data=enrich.to_highlighted_excel(df_out, enriched["sheet"]),
                     file_name=f"{enriched['name']}_enriched_{stamp}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary", width="stretch",
+                    type="primary",
                 )
-                d2.download_button(
+                sheet_buttons.download_button(
                     "📥 Download CSV", data=df_out.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"{enriched['name']}_enriched_{stamp}.csv", mime="text/csv", width="stretch",
+                    file_name=f"{enriched['name']}_enriched_{stamp}.csv", mime="text/csv",
                 )
+                sheet_save_msg = st.empty()
+                if sheet_buttons.button("💾 Save to Azure SQL", key="save_sheet", disabled=db_cfg is None,
+                             help=None if db_cfg else "Set up Azure SQL in the sidebar first."):
+                    save_to_db(sheet_save_msg, db.records_from_sheet(
+                        df_out, mapping, enriched["vendor_col"], enriched["name"]))
                 st.caption("🟥 No website / unreachable / search failed · 🟨 Not found, Unknown or verify · "
                            "🟩 Website found by search. The Excel file includes a Legend tab.")
             elif not go:
@@ -363,12 +398,17 @@ with tab_urls:
         m4.metric("With insurance/bond", int((df["Insurance or Bond"] != "Unknown").sum()))
         m5.metric("Errors", int((~df["Status"].str.startswith("OK")).sum()))
 
-        st.download_button(
+        url_buttons = st.container(horizontal=True)
+        url_buttons.download_button(
             "📥 Download to Excel",
             data=to_excel(df),
             file_name=f"contacts_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
+        url_save_msg = st.empty()
+        if url_buttons.button("💾 Save to Azure SQL", key="save_urls", disabled=db_cfg is None,
+                     help=None if db_cfg else "Set up Azure SQL in the sidebar first."):
+            save_to_db(url_save_msg, db.records_from_urls(results))
     elif not start:
         table_slot.info("Results will appear here as each site finishes.")
