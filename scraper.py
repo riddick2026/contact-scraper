@@ -47,7 +47,14 @@ OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
 # File-like "emails" such as logo@2x.png that are really asset names
 EMAIL_JUNK_SUFFIX = re.compile(r"\.(png|jpe?g|gif|svg|webp|bmp|ico|css|js|woff2?|ttf|mp4|pdf)$", re.I)
 EMAIL_JUNK_DOMAINS = ("example.com", "example.org", "domain.com", "email.com", "sentry.io",
-                      "wixpress.com", "sentry-next.wixpress.com", "yourdomain.com")
+                      "wixpress.com", "sentry-next.wixpress.com", "yourdomain.com",
+                      # website-builder placeholders and third-party services embedded in sites
+                      "mysite.com", "yoursite.com", "website.com", "godaddy.com", "wix.com", "squarespace.com",
+                      "weebly.com", "wisetack.com", "mytangledweb.com", "hibu.com", "scorpion.co")
+# Local parts that are never a business's contact address (legal pages, bounces, placeholders)
+EMAIL_JUNK_LOCAL = re.compile(r"^(filler|terms|privacy|legal|abuse|noreply|no-reply|donotreply|do-not-reply|"
+                              r"postmaster|mailer-daemon|example|test|user|username|name|email|your-?email|"
+                              r"johndoe|john\.doe|janedoe|webmaster|webmasta)$", re.I)
 
 PHONE_RE = re.compile(
     r"""
@@ -111,6 +118,19 @@ NAME_STOPWORDS = {
     "for", "with", "board", "meet", "leadership", "management", "view", "profile", "linkedin",
     "twitter", "facebook", "instagram", "follow", "subscribe", "newsletter", "blog", "news",
     "careers", "jobs", "press", "media", "partner", "partners", "owner", "vp", "ceo", "cto",
+    # form labels and placeholders: "First Last", "Full Name", "Your Name"
+    "first", "last", "full", "name", "names", "your", "my",
+    # page headings and phrases that look like names
+    "general", "questions", "question", "calculator", "mortgage", "community", "involvement", "plan",
+    "membership", "member", "members", "elementary", "school", "human", "resource", "resources",
+    "international", "business", "design", "designs", "luxurious", "preferred", "premium", "quality",
+    "control", "contractor", "contractors", "every", "job", "see", "it", "first", "gold", "elite",
+    "emerald", "platinum", "diamond", "certified", "award", "awards", "winner", "financing", "warranty",
+    "gallery", "testimonials", "projects", "portfolio", "faq", "faqs", "schedule", "appointment",
+    # place-name words: "Citrus Heights", "Montgomery Village"
+    "heights", "village", "grange", "city", "county", "park", "lake", "beach", "springs", "valley",
+    "hills", "creek", "ridge", "harbor", "island", "mount", "mountain", "bay", "falls", "grove",
+    "junction", "sound", "puget", "seattle", "tacoma", "spokane", "vancouver", "portland", "olympia",
 }
 
 CONTACT_LINK_RE = re.compile(r"contact|get[\s_-]?in[\s_-]?touch|reach[\s_-]?us|kontakt|contacto", re.I)
@@ -256,6 +276,8 @@ def _clean_email(email: str) -> str | None:
         return None
     # Hashes from tracking scripts e.g. 3f2a9c...@sentry.io
     local = email.split("@", 1)[0]
+    if EMAIL_JUNK_LOCAL.match(local):
+        return None
     if len(local) >= 24 and re.fullmatch(r"[0-9a-f]+", local):
         return None
     return email

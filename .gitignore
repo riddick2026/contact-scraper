@@ -10,3 +10,6 @@
 .venv/
 __pycache__/
 venv/
+
+# Local data exports (vendor data stays out of git)
+reports/

@@ -36,6 +36,7 @@ SRC_LOW = "Found by search (verify)"
 SRC_NONE = "No match found"
 SRC_FAILED = "Search failed"
 SRC_NO_NAME = "No vendor name"
+SRC_PHONE_MATCH = "phone-match"  # internal: site shows the sheet's phone number, so it's certainly theirs
 
 OUT_WEBSITE = "Website"
 OUT_SOURCE = "Website Source"
@@ -188,12 +189,19 @@ DIRECTORY_DOMAINS |= {
     "roofingdirectory.net", "whereorg.com", "ccblookup.com", "bestprosintown.com", "roofersready.com",
     "asphaltroofingnationwide.com", "porch.com", "homeyou.com", "modernize.com", "angi.com",
     "callmeplumber.com", "plumbersnearme.com", "findaplumber.com", "buildzoom.com", "levelset.com",
+    # seen matched to the wrong vendors: directories, reference sites, manufacturers, national chains
+    "plumbersofamerica.com", "opengovwa.com", "plumberlocator.us", "wikiwand.com", "merriam-webster.com",
+    "dictionary.com", "compass.com", "redfin.com", "gaf.com", "owenscorning.com", "certainteed.com",
+    "rotorooter.com", "mrrooter.com", "nfl.com", "detroitlions.com", "pugetsystems.com",
+    "findtrustedroofers.com", "findroofingpros.com", "washratings.com", "roofreport.net", "listcentral.us",
+    "namesandnumbers.com", "provenexpert.com", "usbizs.com", "roof.info", "zoom.earth", "visitvancouverwa.com",
+    "101apartmentforrent.com", "roofmyspace.com", "clearme.com", "bizofwa.com",
 }
 # Words in a domain that mark lead-gen/directory/listing sites rather than a vendor's own site
 DIRECTORY_WORDS = re.compile(
     r"directory|lookup|listing|bestpros|bestof|toprated|top10|reviews?|nearme|near-me|findlocal|"
     r"hireapro|getquotes|quotes|leads|ready\b|nationwide|yellow|pages|chamber|association|biaof|"
-    r"members\.", re.I)
+    r"members\.|ratings|findtrusted|findroofing|findplumb|listcentral|bizs\b", re.I)
 DIRECTORY_TITLE = re.compile(r"\b(top \d+|best \d+|\d+ best|directory|near me|list of|reviews? (of|for))\b", re.I)
 
 
@@ -483,15 +491,76 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
 
     if source in (SRC_FOUND, SRC_LOW):
         source = _confirm_match(source, result, row, cfg, location)
+        verdict, why = ("ok", "") if source == SRC_PHONE_MATCH else site_matches_vendor(
+            vendor, url, result.text, f"{location} {cfg.extra_search_terms}")
+        if verdict == "verify":
+            source = SRC_LOW
+        if verdict == "reject":
+            # Data from someone else's site is worse than no data
+            out.update({OUT_WEBSITE: NO_WEBSITE, OUT_SOURCE: SRC_NONE, OUT_STATUS: f"No website found ({why})"})
+            out.update({f: NO_WEBSITE for f in DATA_FIELDS})
+            return out
+        source = SRC_FOUND if source == SRC_PHONE_MATCH else source
         out[OUT_SOURCE] = source
 
-    out[OUT_NAME] = ", ".join(sorted(result.names)) or NOT_FOUND
+    out[OUT_NAME] = ", ".join(sorted(clean_names(sorted(result.names), vendor))) or NOT_FOUND
     out[OUT_EMAIL] = ", ".join(sorted(result.emails)) or NOT_FOUND
     out[OUT_PHONE] = ", ".join(sorted(result.phones)) or NOT_FOUND
     out[OUT_INSURANCE] = result.insurance_summary()  # "Unknown" when nothing found
     missing = [f for f in DATA_FIELDS if out[f] in (NOT_FOUND, INSURANCE_UNKNOWN)]
     out[OUT_STATUS] = "Complete" if not missing else "Partial - missing " + ", ".join(missing)
     return out
+
+
+STATE_NAMES = {"WA": "Washington", "OR": "Oregon", "ID": "Idaho", "CA": "California", "MT": "Montana",
+               "NV": "Nevada", "AZ": "Arizona", "UT": "Utah", "TX": "Texas", "CO": "Colorado"}
+TRADE_STEMS = ["roof", "plumb", "gutter", "drain", "sewer", "rooter", "septic", "siding", "construct",
+               "heating", "hvac", "water heater", "pipe", "leak", "remodel", "contractor"]
+
+
+def _location_terms(location: str) -> list[re.Pattern]:
+    """Whole-word patterns for each city/state word; state codes match case-sensitively."""
+    pats = []
+    for word in re.findall(r"[A-Za-z]+", location):
+        if len(word) == 2 and word.upper() in STATE_NAMES:
+            pats += [re.compile(rf"\b{word.upper()}\b"), re.compile(rf"\b{STATE_NAMES[word.upper()]}\b", re.I)]
+        elif len(word) >= 3:
+            pats.append(re.compile(rf"\b{re.escape(word)}\b", re.I))
+    return pats
+
+
+def site_matches_vendor(vendor: str, url: str, text: str, location: str = "") -> tuple[str, str]:
+    """Sanity-check a search-found site against the vendor: ("ok" | "verify" | "reject", reason).
+
+    The page must mention the vendor's distinctive name words (or carry them in its domain) and
+    its trade, when the name has one; otherwise it's rejected. This rejects directories and
+    unrelated sites ("Lions Rooter" -> detroitlions.com). Not mentioning the vendor's city/state
+    rejects a weak domain match (likely a namesake elsewhere) but only flags a strong one for
+    checking, since many sites render their text with JavaScript.
+    """
+    low = text.lower()
+    root = re.sub(r"[^a-z0-9]", "", _registered_domain(urlparse(url).hostname or "").split(".")[0])
+    tokens = _name_tokens(vendor)
+    distinct = [t for t in tokens if t not in GENERIC_WORDS and t not in PLACE_WORDS] or tokens
+    flat = re.sub(r"[^a-z0-9]", "", low)
+    if not all(_token_in(t, root) or re.search(rf"\b{re.escape(t)}", low) or _token_in(t, flat[:20000])
+               for t in distinct):
+        return "reject", "site doesn't mention the vendor's name"
+    trades = [stem for stem in TRADE_STEMS if stem in vendor.lower()]
+    if trades and not any(stem in low for stem in trades):
+        return "reject", "site isn't about the vendor's trade"
+    places = _location_terms(location)
+    if places and not any(p.search(text) for p in places):
+        strong = score_candidate(vendor, url, "", location)[0] >= 0.8
+        return ("verify" if strong else "reject"), "site doesn't mention the vendor's area"
+    return "ok", ""
+
+
+def clean_names(names: list[str], vendor: str) -> list[str]:
+    """Drop 'names' that are really the business's own name ("Clog Busters" for Clog Busters LLC)."""
+    vendor_words = set(_name_tokens(vendor)) | GENERIC_WORDS
+    return [n for n in names
+            if not set(re.findall(r"[a-z0-9]+", n.lower().replace("’", "'").replace("'s", "s"))) <= vendor_words]
 
 
 def _match_output_col(field: str, norm: str) -> bool:
@@ -523,7 +592,7 @@ def _confirm_match(source: str, result, row: dict, cfg: EnrichConfig, location: 
     site_phones = {d[-10:] for d in (re.sub(r"\D", "", p) for p in result.phones)}
     text_digits = re.sub(r"\D", "", result.text)
     if sheet_phones and (sheet_phones & site_phones or any(p in text_digits for p in sheet_phones)):
-        return SRC_FOUND  # the vendor's own phone number is on the site
+        return SRC_PHONE_MATCH  # the vendor's own phone number is on the site
     city_words = [w for w in re.findall(r"[a-z]{3,}", location.lower())]
     if city_words and not any(re.search(rf"\b{re.escape(w)}\b", result.text, re.I) for w in city_words):
         return SRC_LOW  # site never mentions the vendor's city: probably a namesake elsewhere
