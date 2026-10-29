@@ -17,7 +17,7 @@ try:
 except ImportError:
     PARSER = "html.parser"
 
-REQUEST_TIMEOUT = 5  # seconds, per request
+REQUEST_TIMEOUT = 10  # seconds, per request
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 "
@@ -91,6 +91,10 @@ NAME_PATTERNS = [
     re.compile(rf"\b(?:{TITLES})\s*[:\-–,]?\s+({FULL_NAME})"),
     # "Contact Jane Smith at", "email Jane Smith"
     re.compile(rf"\b(?i:contact|email|call)\s+({FULL_NAME})\s+(?:at|on|via)\b"),
+    # "founded by Jane Smith", "owned and operated by Jane Smith"
+    re.compile(rf"\b(?i:founded|started|established|owned(?:\s+and\s+operated)?|run|led)\s+(?i:by)\s+({FULL_NAME})"),
+    # "Hi, I'm Jane Smith", "My name is Jane Smith", "Meet Jane Smith"
+    re.compile(rf"(?i:\bmy\s+name\s+is|\bhi,?\s+i['’]?m|\bi\s+am|\bmeet)\s+({FULL_NAME})"),
 ]
 
 # Words that look Capitalised but are never part of a person's name
@@ -284,6 +288,21 @@ def _clean_phone(raw: str) -> str | None:
     digits = _phone_digits(raw)
     if not 7 <= len(digits) <= 15:
         return None
+    ext = EXTENSION_RE.search(raw)
+    ext_txt = f" x{re.sub(r'[^0-9]', '', ext.group(0))}" if ext else ""
+    stripped = raw.strip()
+    nanp = None
+    if len(digits) == 11 and digits[0] == "1":
+        nanp = digits[1:]
+    elif len(digits) == 10 and not stripped.startswith("+"):
+        nanp = digits
+    elif stripped.startswith("+1"):
+        return None  # "+1..." without exactly 10 more digits is a typo (e.g. tel:+136-5747248)
+    if nanp is not None:
+        # North American numbers: area code and exchange can't start with 0 or 1
+        if nanp[0] in "01" or nanp[3] in "01" or len(set(nanp)) <= 2:
+            return None
+        return f"({nanp[:3]}) {nanp[3:6]}-{nanp[6:]}{ext_txt}"
     if len(set(digits)) <= 2:  # 0000000, 1111111111 etc.
         return None
     # Reject things that look like dates/years ranges, e.g. 2019-2024
@@ -473,6 +492,21 @@ def find_contact_link(soup: BeautifulSoup, base_url: str) -> str | None:
     return contact or about
 
 
+def find_about_link(soup: BeautifulSoup, base_url: str, skip: list[str]) -> str | None:
+    """Return an About/Team page on the same domain that hasn't been scraped yet."""
+    skip_norm = {s.rstrip("/") for s in skip} | {base_url.rstrip("/")}
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        absolute = urljoin(base_url, href).split("#", 1)[0]
+        if not _same_domain(absolute, base_url) or absolute.rstrip("/") in skip_norm:
+            continue
+        if ABOUT_LINK_RE.search(f"{a.get_text(' ', strip=True)} {href}"):
+            return absolute
+    return None
+
+
 def find_insurance_link(soup: BeautifulSoup, base_url: str, skip: list[str]) -> str | None:
     """Return a licensing/insurance page on the same domain, falling back to 'About'."""
     skip_norm = {s.rstrip("/") for s in skip}
@@ -509,6 +543,31 @@ def fetch(session: requests.Session, url: str) -> tuple[str, str]:
     return resp.url, resp.text
 
 
+def _url_variants(url: str) -> list[str]:
+    """The URL, then www-toggled and plain-HTTP versions (small sites are often misconfigured)."""
+    p = urlparse(url)
+    host = p.netloc
+    alt_host = host[4:] if host.lower().startswith("www.") else f"www.{host}"
+    variants = [url, p._replace(netloc=alt_host).geturl()]
+    if p.scheme == "https":
+        variants += [v.replace("https://", "http://", 1) for v in list(variants)]
+    return variants
+
+
+def fetch_with_fallbacks(session: requests.Session, url: str) -> tuple[str, str]:
+    last_exc: Exception | None = None
+    for candidate in _url_variants(url):
+        try:
+            return fetch(session, candidate)
+        except requests.exceptions.HTTPError:
+            raise  # the server answered; a different host spelling won't help
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+            if isinstance(exc, requests.exceptions.Timeout):
+                break  # a slow site won't get faster; don't spend 4x the timeout
+    raise last_exc  # type: ignore[misc]
+
+
 def _scrape_page(result: ScrapeResult, url: str, html: str) -> BeautifulSoup:
     link_soup = BeautifulSoup(html, PARSER)
     text = _visible_text(BeautifulSoup(html, PARSER))
@@ -534,11 +593,7 @@ def scrape_url(raw_url: str) -> ScrapeResult:
 
     with requests.Session() as session:
         try:
-            try:
-                final_url, html = fetch(session, url)
-            except requests.exceptions.SSLError:
-                # Some small-business sites only serve plain HTTP
-                final_url, html = fetch(session, url.replace("https://", "http://", 1))
+            final_url, html = fetch_with_fallbacks(session, url)
         except requests.exceptions.Timeout:
             result.status = "Connection Error (timeout)"
             return result
@@ -555,8 +610,10 @@ def scrape_url(raw_url: str) -> ScrapeResult:
         try:
             soup = _scrape_page(result, final_url, html)
 
-            if not result.has_contact_info():
+            if not (result.emails and result.phones):
                 follow = find_contact_link(soup, final_url)
+                if follow and follow.rstrip("/") in {u.rstrip("/") for u in result.pages_scraped}:
+                    follow = None
                 if follow:
                     try:
                         sub_url, sub_html = fetch(session, follow)
@@ -565,8 +622,12 @@ def scrape_url(raw_url: str) -> ScrapeResult:
                         result.status = "OK (contact page failed to load)"
 
             # Insurance/licence claims often live on an About or Licensing page
-            if not result.has_insurance_info():
-                follow = find_insurance_link(soup, final_url, result.pages_scraped)
+            # Owner/team names usually live on an About or Team page
+            if not result.has_insurance_info() or not result.names:
+                if result.has_insurance_info():
+                    follow = find_about_link(soup, final_url, result.pages_scraped)
+                else:
+                    follow = find_insurance_link(soup, final_url, result.pages_scraped)
                 if follow:
                     try:
                         sub_url, sub_html = fetch(session, follow)

@@ -21,7 +21,9 @@ Upload a **CSV or Excel** file, or paste a **Google Sheet** link (shared as "Any
 
 Values already in the sheet (e.g. an existing Email) are kept; only blanks are filled. Columns are auto-detected and can be changed before running. Results download as a colour-coded `.xlsx` or a `.csv` (import into Google Sheets with File → Import).
 
-Website search uses DuckDuckGo (free, no key). For long lists, add a free **Brave Search API key** in the sidebar for faster, more reliable lookups.
+Website search tries several free engines in turn (DuckDuckGo, then Bing) and records the reason in **Scrape Status** if all of them fail. Use **Test website search** in the sidebar to check search works on your network. For long lists, add a free **Brave Search API key** in the sidebar for faster, more reliable lookups.
+
+You can re-upload a results file: cells holding `Search failed`, `Not found`, etc. are treated as blank and re-processed.
 
 ## Paste URLs mode
 

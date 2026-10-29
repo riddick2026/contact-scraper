@@ -135,6 +135,18 @@ with st.sidebar:
         help="Used to look up vendor websites. Without a key the app uses DuckDuckGo, which is free "
              "but may slow down or block very long lists. Free keys: brave.com/search/api",
     )
+    with st.expander("Test website search"):
+        test_q = st.text_input("Search for", value="Gold Shield Roofing Vancouver WA")
+        if st.button("Run test search"):
+            tester = enrich.WebSearch(brave_key)
+            try:
+                with st.spinner("Searching…"):
+                    hits = tester.search(test_q)
+                st.success(f"Search works ({tester.last_engine}) — {len(hits)} results")
+                for h in hits[:5]:
+                    st.caption(h["url"])
+            except enrich.SearchError as exc:
+                st.error(f"Search failed: {exc}")
     if st.button("Clear results"):
         st.session_state.results = []
         st.session_state.enriched = None
@@ -212,7 +224,8 @@ with tab_sheet:
                                       website_col=None if website_sel == none else website_sel,
                                       location_cols=location_cols)
             to_search = sum(1 for _, r in df_in.iterrows()
-                            if not (cfg.website_col and str(r[cfg.website_col]).strip()))
+                            if not (cfg.website_col and str(r[cfg.website_col]).strip()
+                                    and str(r[cfg.website_col]).strip() not in enrich.PLACEHOLDERS))
             st.markdown(f"**{len(df_in)}** vendors · **{to_search}** need a website lookup")
 
             run_key = (base_name, sheet_name, tuple(cols), len(df_in), vendor_col, website_sel)

@@ -46,6 +46,9 @@ OUT_INSURANCE = "Insurance or Bond"
 OUT_STATUS = "Scrape Status"
 DATA_FIELDS = [OUT_NAME, OUT_EMAIL, OUT_PHONE, OUT_INSURANCE]
 
+# Values this app writes for gaps: treated as blank when a sheet is re-run
+PLACEHOLDERS = {NOT_FOUND, NO_WEBSITE, SITE_UNREACHABLE, SEARCH_FAILED, INSURANCE_UNKNOWN}
+
 # Cells with these values get highlighted in the Excel export
 WARN_VALUES = {NOT_FOUND, INSURANCE_UNKNOWN, SRC_LOW}
 BAD_VALUES = {NO_WEBSITE, SITE_UNREACHABLE, SEARCH_FAILED, SRC_NONE, SRC_FAILED, SRC_NO_NAME}
@@ -220,14 +223,80 @@ class SearchError(Exception):
     pass
 
 
-class WebSearch:
-    """Rate-limited web search. Uses Brave Search if an API key is given, else DuckDuckGo."""
+search_errors: dict[str, str] = {}  # vendor -> last search error, for the status column
 
-    def __init__(self, brave_api_key: str = "", min_interval: float = 1.2):
+
+def _ddg_html(query: str) -> list[dict]:
+    """DuckDuckGo's no-JavaScript results page, fetched directly."""
+    resp = requests.post("https://html.duckduckgo.com/html/", data={"q": query, "kl": "us-en"},
+                         headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(resp.text, "html.parser")
+    out = []
+    for a in soup.select("a.result__a"):
+        href = a.get("href", "")
+        if "uddg=" in href:
+            href = parse_qs(urlparse(href).query).get("uddg", [""])[0]
+        if href.startswith("http") and "duckduckgo.com/y.js" not in href:
+            out.append({"url": href, "title": a.get_text(" ", strip=True)})
+    if not out and ("anomaly" in resp.text.lower() or "challenge" in resp.text.lower()):
+        raise SearchError("DuckDuckGo asked for a bot check")
+    return out
+
+
+def _bing_html(query: str) -> list[dict]:
+    """Bing's results page, fetched directly."""
+    import base64
+    from bs4 import BeautifulSoup
+    resp = requests.get("https://www.bing.com/search",
+                        params={"q": query, "setlang": "en-US", "cc": "US", "count": 15},
+                        headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    out = []
+    for a in soup.select("li.b_algo h2 a"):
+        href = a.get("href", "")
+        if "bing.com/ck/a" in href:  # tracking redirect: real URL is base64 in the "u" parameter
+            u = parse_qs(urlparse(href).query).get("u", [""])[0]
+            if u.startswith("a1"):
+                try:
+                    href = base64.urlsafe_b64decode(u[2:] + "=" * (-len(u[2:]) % 4)).decode()
+                except Exception:  # noqa: BLE001
+                    continue
+        if href.startswith("http"):
+            out.append({"url": href, "title": a.get_text(" ", strip=True)})
+    return out
+
+
+def _ddgs_lib(query: str) -> list[dict]:
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS  # type: ignore  # older package name
+        except ImportError as exc:
+            raise SearchError("ddgs package not installed") from exc
+    results = DDGS().text(query, max_results=10, region="us-en")
+    return [{"url": r.get("href", ""), "title": r.get("title", "")} for r in results or []]
+
+
+class WebSearch:
+    """Rate-limited web search with fallbacks.
+
+    Brave Search API (if a key is given) → ddgs library → DuckDuckGo HTML → Bing HTML.
+    An engine that errors is skipped for the rest of the run after repeated failures.
+    """
+
+    def __init__(self, brave_api_key: str = "", min_interval: float = 1.0):
         self.brave_key = brave_api_key.strip()
         self.min_interval = 0.4 if self.brave_key else min_interval
         self._lock = threading.Lock()
         self._last = 0.0
+        self.failures: dict[str, int] = {}
+        self.last_engine = ""
+        self.engines = ([("Brave", self._brave)] if self.brave_key else []) + [
+            ("ddgs", _ddgs_lib), ("DuckDuckGo", _ddg_html), ("Bing", _bing_html)]
 
     def _wait_turn(self) -> None:
         with self._lock:
@@ -243,41 +312,51 @@ class WebSearch:
             headers={"Accept": "application/json", "X-Subscription-Token": self.brave_key},
             timeout=10,
         )
+        if resp.status_code in (401, 403, 422):
+            raise SearchError("Brave API key rejected")
         if resp.status_code == 429:
-            raise SearchError("rate limited")
+            raise SearchError("Brave rate limit")
         resp.raise_for_status()
         return [{"url": r.get("url", ""), "title": r.get("title", "")}
                 for r in resp.json().get("web", {}).get("results", [])]
 
-    @staticmethod
-    def _ddg(query: str) -> list[dict]:
-        try:
-            from ddgs import DDGS
-        except ImportError:  # older package name
-            from duckduckgo_search import DDGS  # type: ignore
-        results = DDGS().text(query, max_results=10, region="us-en")
-        return [{"url": r.get("href", ""), "title": r.get("title", "")} for r in results or []]
+    # kept for tests/back-compat: the first non-Brave engine
+    def _ddg(self, query: str) -> list[dict]:
+        return _ddgs_lib(query)
 
     def search(self, query: str) -> list[dict]:
-        last_exc: Exception | None = None
-        for attempt in range(3):
-            self._wait_turn()
-            try:
-                return self._brave(query) if self.brave_key else self._ddg(query)
-            except Exception as exc:  # noqa: BLE001 - network/rate-limit errors: back off and retry
-                last_exc = exc
-                if "no results" in str(exc).lower():
-                    return []
-                time.sleep(2 * (attempt + 1))
-        raise SearchError(str(last_exc))
+        errors = []
+        for attempt in range(2):
+            for name, engine in self.engines:
+                if self.failures.get(name, 0) >= 3:
+                    continue  # this engine keeps failing on this network; stop trying it
+                self._wait_turn()
+                try:
+                    results = (self._ddg(query) if name == "ddgs" else engine(query))
+                except Exception as exc:  # noqa: BLE001 - try the next engine
+                    with self._lock:
+                        self.failures[name] = self.failures.get(name, 0) + 1
+                    msg = str(exc).strip().splitlines()[0][:80] if str(exc).strip() else ""
+                    errors.append(f"{name}: {type(exc).__name__}{' ' + msg if msg else ''}")
+                    continue
+                with self._lock:
+                    self.failures[name] = 0
+                    self.last_engine = name
+                if results:
+                    return results
+            if not errors:
+                return []  # every engine answered with no results
+            time.sleep(2 * (attempt + 1))
+        raise SearchError("; ".join(dict.fromkeys(errors))[:300] or "all search engines failed")
 
 
 def find_website(search: WebSearch, vendor: str, location: str = "") -> tuple[str, str]:
-    """Return (homepage url or '', source label)."""
+    """Return (homepage url or '', source label). On failure the reason is in search.errors."""
     query = f"{vendor} {location}".strip()
     try:
         results = search.search(query)
-    except SearchError:
+    except SearchError as exc:
+        search_errors[vendor] = str(exc)
         return "", SRC_FAILED
 
     best, best_key = None, (-1.0, -1.0)
@@ -314,6 +393,8 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
     """Return the output fields for one input row."""
     vendor = str(row.get(cfg.vendor_col, "")).strip()
     given = str(row.get(cfg.website_col, "")).strip() if cfg.website_col else ""
+    if given in PLACEHOLDERS:
+        given = ""
     location = " ".join(str(row.get(c, "")).strip() for c in cfg.location_cols).strip()
     out: dict[str, str] = {}
 
@@ -330,7 +411,7 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
         filler = SEARCH_FAILED if source == SRC_FAILED else NO_WEBSITE
         out[OUT_WEBSITE] = given or filler
         out.update({f: filler for f in DATA_FIELDS})
-        out[OUT_STATUS] = {SRC_FAILED: "Search failed - try again later",
+        out[OUT_STATUS] = {SRC_FAILED: "Search failed - " + search_errors.get(vendor, "try again later"),
                            SRC_NO_NAME: "Skipped - no vendor name or website"}.get(source, "No website found")
         return out
 
@@ -350,24 +431,39 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
     return out
 
 
+def _match_output_col(field: str, norm: str) -> bool:
+    if field == OUT_EMAIL:
+        return "email" in norm or norm == "mail"
+    if field == OUT_PHONE:
+        return any(k in norm for k in ("phone", "telephone", "mobile", "cell")) or norm in ("tel", "number")
+    if field == OUT_NAME:
+        return norm in ("contact", "contactname", "contactperson", "name") or (
+            "contact" in norm and "name" in norm) or norm in ("owner", "ownername", "primarycontact")
+    if field == OUT_INSURANCE:
+        return "insurance" in norm or "bond" in norm
+    if field == OUT_WEBSITE:
+        return norm in ("website", "websiteurl", "url", "site", "web", "homepage", "domain")
+    if field == OUT_SOURCE:
+        return norm == "websitesource"
+    if field == OUT_STATUS:
+        return norm == "scrapestatus"
+    return False
+
+
 def output_columns(df: pd.DataFrame, cfg: EnrichConfig) -> dict[str, str]:
-    """Map each output field to the sheet column it goes in (existing column if names match)."""
-    existing = {re.sub(r"[^a-z]", "", c.lower()): c for c in df.columns}
-    aliases = {
-        OUT_WEBSITE: ["website", "url", "websiteurl", "site", "web"],
-        OUT_NAME: ["contactname", "contact", "contactperson"],
-        OUT_EMAIL: ["email", "emailaddress", "emails"],
-        OUT_PHONE: ["phone", "phonenumber", "phonenumbers", "telephone", "phones"],
-        OUT_INSURANCE: ["insuranceorbond", "insurance", "insurancebond", "bond"],
-        OUT_SOURCE: ["websitesource"],
-        OUT_STATUS: ["scrapestatus"],
-    }
-    mapping = {}
-    for field, keys in aliases.items():
+    """Map each output field to the sheet column it goes in (existing column when one fits)."""
+    taken = {cfg.vendor_col, *cfg.location_cols}
+    mapping: dict[str, str] = {}
+    for field in [OUT_WEBSITE, OUT_SOURCE, OUT_STATUS, OUT_EMAIL, OUT_PHONE, OUT_INSURANCE, OUT_NAME]:
         if field == OUT_WEBSITE and cfg.website_col:
             mapping[field] = cfg.website_col
+            taken.add(cfg.website_col)
             continue
-        mapping[field] = next((existing[k] for k in keys if k in existing), field)
+        match = next((c for c in df.columns if c not in taken
+                      and _match_output_col(field, re.sub(r"[^a-z]", "", c.lower()))), None)
+        mapping[field] = match or field
+        if match:
+            taken.add(match)
     return mapping
 
 
@@ -377,7 +473,7 @@ def merge_row(row: dict, out: dict, mapping: dict[str, str]) -> dict:
     for field, value in out.items():
         col = mapping[field]
         current = str(merged.get(col, "")).strip()
-        if field in (OUT_SOURCE, OUT_STATUS) or not current:
+        if field in (OUT_SOURCE, OUT_STATUS) or not current or current in PLACEHOLDERS:
             merged[col] = value
     return merged
 
