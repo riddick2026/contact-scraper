@@ -1,7 +1,8 @@
 """Azure SQL storage for scrape results.
 
 One row per vendor (spreadsheet mode) or per website (URL mode). Saving again updates the
-existing row; a re-scrape never replaces a real value with a gap marker like "Not found".
+existing row; a re-scrape never replaces a real value with a gap marker like "Not found", and
+rows edited in the viewer only have their empty/gap fields filled.
 
 Connection settings come from environment variables or ``.streamlit/secrets.toml``:
 
@@ -252,15 +253,19 @@ def _merge_sql() -> str:
     gaps = _sql_list(GAP_VALUES)
 
     def keep_real(col: str) -> str:
-        # New real value wins; a new gap marker only fills an empty/gap cell
-        return (f"t.{col} = CASE WHEN s.{col} IS NOT NULL AND s.{col} NOT IN ({gaps}) THEN s.{col} "
+        # New real value wins, unless the row was edited in the viewer; a gap marker (or any value,
+        # for viewer-edited rows) only fills an empty/gap cell
+        return (f"t.{col} = CASE WHEN t.LastEdited IS NULL AND s.{col} IS NOT NULL "
+                f"AND s.{col} NOT IN ({gaps}) THEN s.{col} "
                 f"WHEN t.{col} IS NULL OR t.{col} IN ({gaps}) THEN COALESCE(s.{col}, t.{col}) "
                 f"ELSE t.{col} END")
 
     updates = ",\n        ".join(
         [keep_real(c) for c in DATA_COLUMNS]
-        + ["t.WebsiteDomain = COALESCE(s.WebsiteDomain, t.WebsiteDomain)",
-           "t.VendorName = COALESCE(s.VendorName, t.VendorName)",
+        + ["t.WebsiteDomain = CASE WHEN t.LastEdited IS NULL THEN COALESCE(s.WebsiteDomain, t.WebsiteDomain) "
+           "ELSE COALESCE(t.WebsiteDomain, s.WebsiteDomain) END",
+           "t.VendorName = CASE WHEN t.LastEdited IS NULL THEN COALESCE(s.VendorName, t.VendorName) "
+           "ELSE COALESCE(t.VendorName, s.VendorName) END",
            "t.ScrapeStatus = s.ScrapeStatus",
            "t.SourceFile = COALESCE(s.SourceFile, t.SourceFile)",
            "t.ExtraData = COALESCE(s.ExtraData, t.ExtraData)",
@@ -325,3 +330,110 @@ def save_records(cfg: DbConfig, records: list[dict]) -> dict[str, int]:
     finally:
         conn.close()
     return {"inserted": actions.count("INSERT"), "updated": actions.count("UPDATE")}
+
+
+# --------------------------------------------------------------------------- #
+# Viewer: load, edit, add, delete
+# --------------------------------------------------------------------------- #
+
+SOURCE_MANUAL = "Manual"
+
+# Columns the viewer lets people change
+EDITABLE_COLUMNS = ["VendorName", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes"]
+VIEW_COLUMNS = ["Id", *EDITABLE_COLUMNS, "WebsiteSource", "ScrapeStatus", "Source", "SourceFile", "ExtraData",
+                "FirstSeen", "LastScraped", "LastEdited", "LastEditedBy"]
+
+
+@dataclass
+class ChangeResult:
+    updated: int = 0
+    inserted: int = 0
+    deleted: int = 0
+    conflicts: list[str] | None = None  # rows changed by someone else since loading
+
+
+def load_vendors(cfg: DbConfig) -> tuple[pd.DataFrame, dict[int, bytes]]:
+    """All saved records, newest activity first, plus each row's version stamp by Id."""
+    conn = connect(cfg)
+    try:
+        ensure_schema(conn)
+        cur = conn.cursor()
+        cur.execute(f"SELECT {', '.join(VIEW_COLUMNS)}, RowVer FROM dbo.Vendors "
+                    "ORDER BY COALESCE(LastEdited, LastScraped) DESC, Id DESC")
+        rows = cur.fetchall()
+    except DbError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise DbError(_friendly(exc)) from exc
+    finally:
+        conn.close()
+    df = pd.DataFrame([list(r)[:-1] for r in rows], columns=VIEW_COLUMNS)
+    versions = {int(r[0]): bytes(r[-1]) for r in rows}
+    return df, versions
+
+
+def _label(row: dict) -> str:
+    return str(row.get("VendorName") or row.get("Website") or f"record {row.get('Id')}")
+
+
+def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, dict],
+                  inserts: list[dict], deletes: list[int], names: dict[int, str] | None = None) -> ChangeResult:
+    """Write viewer edits in one transaction.
+
+    Updates and deletes only apply if the row hasn't changed since it was loaded (its
+    RowVer still matches); otherwise they're skipped and reported as conflicts.
+    """
+    result = ChangeResult(conflicts=[])
+    names = names or {}
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        for row_id, changes in updates.items():
+            sets = {c: _text(v) for c, v in changes.items() if c in EDITABLE_COLUMNS}
+            if not sets:
+                continue
+            if "Website" in sets:
+                sets["WebsiteDomain"] = _domain(sets["Website"])
+            assignments = ", ".join(f"{c} = ?" for c in sets)
+            cur.execute(
+                f"UPDATE dbo.Vendors SET {assignments}, LastEdited = SYSUTCDATETIME(), "
+                "LastEditedBy = SUSER_SNAME() WHERE Id = ? AND RowVer = ?",
+                [*sets.values(), row_id, versions[row_id]],
+            )
+            if cur.rowcount == 1:
+                result.updated += 1
+            else:
+                result.conflicts.append(names.get(row_id) or f"record {row_id}")
+
+        for row_id in deletes:
+            cur.execute("DELETE FROM dbo.Vendors WHERE Id = ? AND RowVer = ?", [row_id, versions[row_id]])
+            if cur.rowcount == 1:
+                result.deleted += 1
+            else:
+                result.conflicts.append(f"{names.get(row_id) or f'record {row_id}'} (not deleted)")
+
+        for row in inserts:
+            fields = {c: row.get(c) for c in EDITABLE_COLUMNS if c not in ("VendorName", "Website", "Notes")}
+            rec = _record(row.get("VendorName"), row.get("Website"), Source=SOURCE_MANUAL, **fields)
+            if rec is None:
+                continue  # blank row
+            cur.execute("SELECT 1 FROM dbo.Vendors WHERE RecordKey = ?", [rec["RecordKey"]])
+            if cur.fetchone():
+                result.conflicts.append(f"{_label(rec)} (already exists, not added)")
+                continue
+            cols = [*FIELDS, "Notes", "LastEdited", "LastEditedBy"]
+            cur.execute(
+                f"INSERT INTO dbo.Vendors ({', '.join(cols)}) "
+                f"VALUES ({', '.join('?' * (len(FIELDS) + 1))}, SYSUTCDATETIME(), SUSER_SNAME())",
+                [*(rec[f] for f in FIELDS), _text(row.get("Notes"))],
+            )
+            result.inserted += 1
+        conn.commit()
+    except DbError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        raise DbError(_friendly(exc)) from exc
+    finally:
+        conn.close()
+    return result
