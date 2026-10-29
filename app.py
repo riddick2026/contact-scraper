@@ -220,15 +220,21 @@ with tab_sheet:
             with st.expander(f"Preview — {len(df_in)} rows", expanded=False):
                 st.dataframe(df_in.head(20), width="stretch", hide_index=True)
 
+            extra_terms = st.text_input(
+                "Extra search words (optional)", placeholder="e.g. WA",
+                help="Added to every website search, e.g. the state, to avoid same-named businesses elsewhere.")
             cfg = enrich.EnrichConfig(vendor_col=vendor_col,
                                       website_col=None if website_sel == none else website_sel,
-                                      location_cols=location_cols)
+                                      location_cols=location_cols, extra_search_terms=extra_terms.strip())
+            _map = enrich.output_columns(df_in, cfg)
+            if _map[enrich.OUT_PHONE] in df_in.columns:
+                cfg.phone_col = _map[enrich.OUT_PHONE]  # sheet phone confirms search matches
             to_search = sum(1 for _, r in df_in.iterrows()
                             if not (cfg.website_col and str(r[cfg.website_col]).strip()
                                     and str(r[cfg.website_col]).strip() not in enrich.PLACEHOLDERS))
             st.markdown(f"**{len(df_in)}** vendors · **{to_search}** need a website lookup")
 
-            run_key = (base_name, sheet_name, tuple(cols), len(df_in), vendor_col, website_sel)
+            run_key = (base_name, sheet_name, tuple(cols), len(df_in), vendor_col, website_sel, extra_terms)
             go = st.button("Find websites & scrape", type="primary", key="go_sheet")
             sheet_progress, sheet_status, sheet_table = st.empty(), st.empty(), st.empty()
 
@@ -255,6 +261,7 @@ with tab_sheet:
                 labels = [str(r.get(vendor_col, "")) or f"row {i + 2}" for i, r in enumerate(records)]
                 progress = sheet_progress.progress(0.0, text=f"0 / {len(records)} complete")
                 rows = run_concurrent(labels, task, workers, progress, sheet_status, render)
+                enrich.flag_shared_sites(rows, mapping, vendor_col)
                 st.session_state.enriched = {
                     "df": pd.DataFrame(rows, columns=columns), "mapping": mapping, "key": run_key,
                     "name": base_name, "sheet": sheet_name,

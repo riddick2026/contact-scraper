@@ -201,6 +201,7 @@ class ScrapeResult:
     insurance_terms: set[str] = field(default_factory=set)        # licensed / bonded / insured
     insurance_details: dict[str, None] = field(default_factory=dict)  # ordered set of findings
     pages_scraped: list[str] = field(default_factory=list)
+    text: str = ""  # visible text of scraped pages, used to sanity-check search matches
 
     def has_contact_info(self) -> bool:
         return bool(self.emails or self.phones)
@@ -331,8 +332,24 @@ def extract_phones(soup: BeautifulSoup, text: str) -> set[str]:
     return set(by_digits.values())
 
 
+NAME_TRADE_WORDS = {
+    "roofing", "roofer", "roofers", "roof", "plumbing", "plumber", "plumbers", "gutter", "gutters",
+    "construction", "heating", "cooling", "exteriors", "exterior", "solar", "operated", "licensed",
+    "insured", "bonded", "wine", "estimate", "estimates", "free", "repair", "residential", "commercial",
+    "drain", "sewer", "water", "home", "homes", "llc", "inc", "corp", "systems", "solutions", "quote",
+    "reviews", "review", "google", "yelp", "certified", "installation", "emergency", "today", "now",
+}
+
+
 def _valid_name(name: str) -> str | None:
     name = re.sub(r"\s+", " ", name).strip(" ,.-–|")
+    if re.search(r"[,\d@/()&]", name):
+        return None
+    parts_ = name.split()
+    if len(parts_) >= 2 and (len(parts_[0].strip(".")) < 2 or len(parts_[-1].strip(".")) < 2):
+        return None  # "Justine S", "P Greg": initials-only first/last names are review handles
+    if any(w.lower().strip(".") in NAME_TRADE_WORDS for w in parts_):
+        return None
     parts = name.replace(".", ". ").split()
     words = [w.strip(".").lower() for w in parts if w.strip(".")]
     if len(words) < 2 or len(words) > 4:
@@ -351,12 +368,13 @@ def _names_from_structured_data(soup: BeautifulSoup) -> set[str]:
         if isinstance(node, dict):
             types = node.get("@type")
             types = types if isinstance(types, list) else [types]
+            if "Review" in types or "Comment" in types:
+                return  # review/comment authors are customers, not contacts
             if "Person" in types and isinstance(node.get("name"), str):
                 names.add(node["name"])
-            for key in ("founder", "employee", "author", "contactPoint", "member"):
-                if key in node:
-                    walk(node[key])
-            for v in node.values():
+            for k, v in node.items():
+                if k in ("review", "reviews", "comment", "aggregateRating"):
+                    continue
                 if isinstance(v, (dict, list)):
                     walk(v)
         elif isinstance(node, list):
@@ -580,6 +598,7 @@ def _scrape_page(result: ScrapeResult, url: str, html: str) -> BeautifulSoup:
     for item in details:
         result.insurance_details.setdefault(item, None)
     result.pages_scraped.append(url)
+    result.text += "\n" + text[:150_000]
     return link_soup
 
 

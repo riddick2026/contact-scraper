@@ -172,8 +172,8 @@ DIRECTORY_DOMAINS = {
     "dexknows.com", "local.com", "porch.com", "angi.com", "procore.com", "contractorsdirectory.com",
 }
 NAME_STOPWORDS = {"llc", "inc", "co", "corp", "corporation", "company", "the", "and", "of", "ltd",
-                  "lp", "llp", "pllc", "pc", "group", "services", "service", "enterprises", "dba",
-                  "incorporated", "limited", "a", "an", "&"}
+                  "lp", "llp", "pllc", "pc", "dba", "incorporated", "limited", "a", "an", "&", "enterprises",
+                  "enterprise", "group"}
 
 
 def _registered_domain(host: str) -> str:
@@ -184,33 +184,90 @@ def _registered_domain(host: str) -> str:
     return ".".join(parts[-2:])
 
 
-def _is_directory(url: str) -> bool:
+DIRECTORY_DOMAINS |= {
+    "roofingdirectory.net", "whereorg.com", "ccblookup.com", "bestprosintown.com", "roofersready.com",
+    "asphaltroofingnationwide.com", "porch.com", "homeyou.com", "modernize.com", "angi.com",
+    "callmeplumber.com", "plumbersnearme.com", "findaplumber.com", "buildzoom.com", "levelset.com",
+}
+# Words in a domain that mark lead-gen/directory/listing sites rather than a vendor's own site
+DIRECTORY_WORDS = re.compile(
+    r"directory|lookup|listing|bestpros|bestof|toprated|top10|reviews?|nearme|near-me|findlocal|"
+    r"hireapro|getquotes|quotes|leads|ready\b|nationwide|yellow|pages|chamber|association|biaof|"
+    r"members\.", re.I)
+DIRECTORY_TITLE = re.compile(r"\b(top \d+|best \d+|\d+ best|directory|near me|list of|reviews? (of|for))\b", re.I)
+
+
+def _is_directory(url: str, title: str = "") -> bool:
     host = (urlparse(url).hostname or "").lower()
     reg = _registered_domain(host)
-    return reg in DIRECTORY_DOMAINS or host.endswith((".gov", ".edu")) or "google." in host
+    if reg in DIRECTORY_DOMAINS or host.endswith((".gov", ".edu", ".org")) or "google." in host:
+        return True
+    return bool(DIRECTORY_WORDS.search(host) or DIRECTORY_TITLE.search(title))
+
+
+# Trade words, descriptors and place words that many vendors share: matching them proves little
+GENERIC_WORDS = {
+    "roof", "roofs", "roofing", "roofer", "roofers", "plumbing", "plumber", "plumbers", "gutter", "gutters",
+    "seamless", "construction", "const", "contractor", "contractors", "contracting", "exterior", "exteriors",
+    "system", "systems", "solution", "solutions", "home", "homes", "house", "service", "services", "heating",
+    "cooling", "hvac", "air", "mechanical", "drain", "drains", "rooter", "sewer", "septic", "custom", "pro",
+    "pros", "professional", "professionals", "nw", "pnw", "northwest", "west", "south", "north", "east",
+    "southwest", "county", "city", "valley", "general", "quality", "best", "premier", "premium", "superior",
+    "advanced", "top", "express", "repair", "repairs", "maintenance", "residential", "commercial", "water",
+    "cleanup", "works", "all", "american", "us", "usa", "wa", "washington", "or", "oregon", "elite",
+    "affordable", "reliable", "local", "family", "brothers", "bros", "sons", "electric", "electrical",
+    "remodeling", "builders", "building", "restoration", "install", "installation", "siding", "windows",
+}
+PLACE_WORDS = {"vancouver", "camas", "washougal", "ridgefield", "battle", "ground", "longview", "kelso",
+               "chehalis", "centralia", "woodland", "yacolt", "clark", "cowlitz", "lewis", "portland",
+               "brush", "prairie", "columbia"}
 
 
 def _name_tokens(name: str) -> list[str]:
-    words = re.findall(r"[a-z0-9]+", name.lower().replace("&", " and "))
+    """Meaningful words of a business name; letter pairs like 'J&J' become one token 'jnj'."""
+    text = name.lower().replace("’", "'")
+    text = re.sub(r"\(.*?\)", lambda m: " " + m.group(0)[1:-1] + " ", text)
+    text = re.sub(r"\b([a-z])\s*(?:&|\+|and|n)\s*([a-z])\b", r" \1n\2 ", text)   # J&J -> jnj
+    text = re.sub(r"\b([a-z])\.\s*([a-z])\.", r" \1\2 ", text)                      # J.R. -> jr
+    text = re.sub(r"'s\b", "s", text).replace("&", " and ")
+    words = re.findall(r"[a-z0-9]+", text)
     return [w for w in words if w not in NAME_STOPWORDS and len(w) > 1] or words
 
 
-def score_candidate(vendor: str, url: str, title: str) -> tuple[float, float]:
-    """(domain score, title score) in [0, 1]: how well a search result matches the vendor."""
+def _token_in(token: str, root: str) -> bool:
+    variants = {token}
+    if re.fullmatch(r"[a-z]n[a-z]", token):            # jnj -> jj, jandj
+        variants |= {token[0] + token[2], token[0] + "and" + token[2]}
+    if token.endswith("s") and len(token) > 4:           # eds -> ed, rivers -> river
+        variants.add(token[:-1])
+    return any(v in root for v in variants)
+
+
+def score_candidate(vendor: str, url: str, title: str, location: str = "") -> tuple[float, float]:
+    """(domain score, title score) in [0, 1]: how well a search result matches the vendor.
+
+    Distinctive words (not trade, descriptor or place words) must match for a high score;
+    a name made only of generic words ("Longview Roofing") must match in full.
+    """
     tokens = _name_tokens(vendor)
     if not tokens:
         return 0.0, 0.0
-    root = _registered_domain(urlparse(url).hostname or "").split(".")[0]
-    domain_hits = sum(t in root for t in tokens)
-    initials = "".join(t[0] for t in tokens)
-    domain = domain_hits / len(tokens)
-    if len(tokens) >= 2 and root.startswith(initials):
-        domain = max(domain, 0.6)
-    # Whole name squashed together, e.g. "abcplumbing" for "A B C Plumbing"
-    if "".join(tokens) in root:
-        domain = 1.0
-    title_words = set(re.findall(r"[a-z0-9]+", title.lower()))
-    title_score = sum(t in title_words for t in tokens) / len(tokens)
+    places = PLACE_WORDS | set(re.findall(r"[a-z]+", location.lower()))
+    distinct = [t for t in tokens if t not in GENERIC_WORDS and t not in places]
+    key = distinct or tokens
+    root = re.sub(r"[^a-z0-9]", "", _registered_domain(urlparse(url).hostname or "").split(".")[0])
+
+    domain = sum(_token_in(t, root) for t in key) / len(key)
+    if not distinct and domain < 1.0:
+        domain *= 0.5  # all-generic names ("Kelso Plumbing") need every word in the domain
+    if distinct and domain == 1.0 and not all(_token_in(t, root) for t in tokens):
+        domain = 0.9  # distinctive part matches, some trade words don't: still a strong match
+    if len(tokens) >= 2 and len(root) >= 2 and root.startswith("".join(t[0] for t in tokens)) \
+            and len(root) <= len(tokens) + 4:
+        domain = max(domain, 0.8)  # acronym domain, e.g. "nsd" for "NSD Enterprises"
+    title_words = " ".join(re.findall(r"[a-z0-9]+", title.lower()))
+    title_score = sum(_token_in(t, title_words.replace(" ", "")) or t in title_words.split()
+                      for t in key) / len(key)
     return domain, title_score
 
 
@@ -362,18 +419,18 @@ def find_website(search: WebSearch, vendor: str, location: str = "") -> tuple[st
     best, best_key = None, (-1.0, -1.0)
     for rank, r in enumerate(results):
         url, title = r["url"], r["title"]
-        if not url.startswith("http") or _is_directory(url):
+        if not url.startswith("http") or _is_directory(url, title):
             continue
-        domain, title_score = score_candidate(vendor, url, title)
+        domain, title_score = score_candidate(vendor, url, title, location)
         key = (domain + 0.5 * title_score - 0.02 * rank, domain)
         if key > best_key:
             best, best_key = (url, domain, title_score), key
     if not best:
         return "", SRC_NONE
     url, domain, title_score = best
-    if domain >= 0.5:
+    if domain >= 0.8:
         return _homepage(url), SRC_FOUND
-    if title_score >= 0.6:
+    if domain >= 0.5 or title_score >= 0.99:
         return _homepage(url), SRC_LOW
     return "", SRC_NONE
 
@@ -387,6 +444,8 @@ class EnrichConfig:
     vendor_col: str
     website_col: str | None
     location_cols: list[str]
+    phone_col: str | None = None       # sheet's existing phone, used to confirm search matches
+    extra_search_terms: str = ""       # e.g. "WA", appended to every search
 
 
 def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
@@ -402,7 +461,7 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
     if url:
         source = SRC_PROVIDED
     elif vendor:
-        url, source = find_website(search, vendor, location)
+        url, source = find_website(search, vendor, f"{location} {cfg.extra_search_terms}".strip())
     else:
         url, source = "", SRC_NO_NAME
     out[OUT_SOURCE] = source
@@ -421,6 +480,10 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
         out.update({f: SITE_UNREACHABLE for f in DATA_FIELDS})
         out[OUT_STATUS] = result.status
         return out
+
+    if source in (SRC_FOUND, SRC_LOW):
+        source = _confirm_match(source, result, row, cfg, location)
+        out[OUT_SOURCE] = source
 
     out[OUT_NAME] = ", ".join(sorted(result.names)) or NOT_FOUND
     out[OUT_EMAIL] = ", ".join(sorted(result.emails)) or NOT_FOUND
@@ -448,6 +511,42 @@ def _match_output_col(field: str, norm: str) -> bool:
     if field == OUT_STATUS:
         return norm == "scrapestatus"
     return False
+
+
+def _digits(s: str) -> list[str]:
+    return [d[-10:] for d in (re.sub(r"\D", "", p) for p in re.split(r"[,;/]|\bor\b", s)) if len(d) >= 10]
+
+
+def _confirm_match(source: str, result, row: dict, cfg: EnrichConfig, location: str) -> str:
+    """Upgrade/downgrade a search match using the sheet's phone number and city."""
+    sheet_phones = set(_digits(str(row.get(cfg.phone_col, "")))) if cfg.phone_col else set()
+    site_phones = {d[-10:] for d in (re.sub(r"\D", "", p) for p in result.phones)}
+    text_digits = re.sub(r"\D", "", result.text)
+    if sheet_phones and (sheet_phones & site_phones or any(p in text_digits for p in sheet_phones)):
+        return SRC_FOUND  # the vendor's own phone number is on the site
+    city_words = [w for w in re.findall(r"[a-z]{3,}", location.lower())]
+    if city_words and not any(re.search(rf"\b{re.escape(w)}\b", result.text, re.I) for w in city_words):
+        return SRC_LOW  # site never mentions the vendor's city: probably a namesake elsewhere
+    return source
+
+
+def flag_shared_sites(rows: list[dict], mapping: dict[str, str], vendor_col: str) -> None:
+    """If one website was matched to several vendors, mark the search-found ones to verify."""
+    web, src, status = mapping[OUT_WEBSITE], mapping[OUT_SOURCE], mapping[OUT_STATUS]
+    by_domain: dict[str, list[dict]] = {}
+    for r in rows:
+        host = (urlparse(str(r.get(web, ""))).hostname or "").lower().removeprefix("www.")
+        if host:
+            by_domain.setdefault(host, []).append(r)
+    for group in by_domain.values():
+        if len(group) < 2:
+            continue
+        names = [str(r.get(vendor_col, "")) for r in group]
+        for r in group:
+            if r.get(src) in (SRC_FOUND, SRC_LOW):
+                r[src] = SRC_LOW
+                others = ", ".join(n for n in names if n != r.get(vendor_col))[:80]
+                r[status] = f"{r.get(status, '')} - same site as {others}".strip(" -")
 
 
 def output_columns(df: pd.DataFrame, cfg: EnrichConfig) -> dict[str, str]:
