@@ -60,7 +60,7 @@ Both modes have a **💾 Save to Azure SQL** button. Results go into one table, 
 - A newly scraped real value replaces the stored one; a gap marker (`Not found`, `Unknown`, `Site unreachable`…) never overwrites a real stored value.
 - Once a record has been edited in the Database viewer, re-scrapes only fill its empty or gap fields; your hand edits are kept.
 - A pasted URL updates the vendor row that already has that website, if exactly one does.
-- Other spreadsheet columns are kept as JSON in `ExtraData`. `FirstSeen` / `LastScraped` are tracked, and `Notes`, `LastEdited`, `LastEditedBy` are set by the viewer.
+- A spreadsheet column named **State** fills the record's `State` (otherwise it's left blank to fill in the viewer). Other spreadsheet columns are kept as JSON in `ExtraData`. `FirstSeen` / `LastScraped` are tracked, and `Notes`, `LastEdited`, `LastEditedBy` are set by the viewer.
 
 The app signs in with your Microsoft Entra ID account through the Azure CLI, so no database password is stored anywhere.
 
@@ -69,7 +69,7 @@ The app signs in with your Microsoft Entra ID account through the Azure CLI, so 
 Open **🗂️ Database viewer** in the app's sidebar to browse and update the saved records in a spreadsheet-style grid:
 
 - **Search** across vendor, website, contact, email, phone, insurance and notes; **Show** quick filters (missing email/phone/contact/insurance, website needs checking, edited by hand); **Added from** filters by spreadsheet, URL list or manual.
-- **Edit** a cell by clicking it (press Enter to open it, Enter again to keep the change). Vendor, website, contact name, email, phone, insurance and notes are editable; dates and scrape details are read-only.
+- **Edit** a cell by clicking it (press Enter to open it, Enter again to keep the change). Vendor, state, website, contact name, email, phone, insurance and notes are editable; dates and scrape details are read-only.
 - **Add** a record in the empty last row. **Delete** by selecting rows by their left edge and pressing Delete; you confirm before anything is removed.
 - Nothing is written until **Save changes**. Each change records who made it and when. If a record was re-scraped or edited elsewhere after you loaded it, your change to that record is skipped and reported instead of overwriting newer data.
 - **Download this view** exports the filtered records to Excel.
