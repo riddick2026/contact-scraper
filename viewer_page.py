@@ -27,6 +27,7 @@ FILTERS = {
 COLUMN_CONFIG = {
     "Id": st.column_config.NumberColumn("ID", width="small", format="%d"),
     "VendorName": st.column_config.TextColumn("Vendor", width="medium"),
+    "State": st.column_config.TextColumn("State", width="small"),
     "Website": st.column_config.TextColumn("Website", width="medium"),
     "ContactName": st.column_config.TextColumn("Contact name", width="medium"),
     "Email": st.column_config.TextColumn("Email", width="medium"),
@@ -159,7 +160,7 @@ picked = f3.multiselect("Added from", sources, default=sources)
 view = FILTERS[show](df_all)
 view = view[view["Source"].isin(picked)]
 if search.strip():
-    text = view[["VendorName", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes",
+    text = view[["VendorName", "State", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes",
                  "ExtraData"]].fillna("").astype(str).agg(" ".join, axis=1)
     view = view[text.str.contains(search.strip(), case=False, regex=False)]
 view = view.reset_index(drop=True)

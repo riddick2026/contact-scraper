@@ -37,7 +37,7 @@ SOURCE_URLS = "URL list"
 GAP_VALUES = sorted(enrich.PLACEHOLDERS | {INSURANCE_UNKNOWN, enrich.SRC_NONE, enrich.SRC_NO_NAME})
 
 # Columns written by a save, in staging/insert order
-FIELDS = ["RecordKey", "VendorName", "Website", "WebsiteDomain", "WebsiteSource", "ContactName", "Email",
+FIELDS = ["RecordKey", "VendorName", "State", "Website", "WebsiteDomain", "WebsiteSource", "ContactName", "Email",
           "Phone", "InsuranceOrBond", "ScrapeStatus", "PagesScraped", "Source", "SourceFile", "ExtraData"]
 # Scraped values that follow the "real value beats gap marker" rule
 DATA_COLUMNS = ["Website", "WebsiteSource", "ContactName", "Email", "Phone", "InsuranceOrBond", "PagesScraped"]
@@ -49,6 +49,7 @@ BEGIN
         Id              INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_Vendors PRIMARY KEY,
         RecordKey       NVARCHAR(450)  NOT NULL CONSTRAINT UQ_Vendors_RecordKey UNIQUE,
         VendorName      NVARCHAR(400)  NULL,
+        State           NVARCHAR(100)  NULL,
         Website         NVARCHAR(1000) NULL,
         WebsiteDomain   NVARCHAR(255)  NULL,
         WebsiteSource   NVARCHAR(100)  NULL,
@@ -70,6 +71,9 @@ BEGIN
     );
     CREATE INDEX IX_Vendors_WebsiteDomain ON dbo.Vendors (WebsiteDomain);
 END
+-- Columns added after the table was first created
+IF COL_LENGTH(N'dbo.Vendors', N'State') IS NULL
+    ALTER TABLE dbo.Vendors ADD State NVARCHAR(100) NULL;
 """
 
 
@@ -204,9 +208,17 @@ def _record(vendor, website, **fields) -> dict | None:
     return rec
 
 
+def _state_column(columns, taken: set) -> str | None:
+    return next((c for c in columns if c not in taken
+                 and re.sub(r"[^a-z]", "", str(c).lower()) in ("state", "st", "stateprovince", "province")), None)
+
+
 def records_from_sheet(df: pd.DataFrame, mapping: dict[str, str], vendor_col: str, source_file: str) -> list[dict]:
     """Records from spreadsheet-mode results; unmapped sheet columns go into ExtraData."""
     used = {vendor_col, *mapping.values()}
+    state_col = _state_column(df.columns, used)
+    if state_col:
+        used.add(state_col)
     extra_cols = [c for c in df.columns if c not in used]
     out = []
     for row in df.to_dict("records"):
@@ -219,6 +231,7 @@ def records_from_sheet(df: pd.DataFrame, mapping: dict[str, str], vendor_col: st
             Phone=row.get(mapping[enrich.OUT_PHONE]),
             InsuranceOrBond=row.get(mapping[enrich.OUT_INSURANCE]),
             ScrapeStatus=row.get(mapping[enrich.OUT_STATUS]),
+            State=row.get(state_col) if state_col else None,
             Source=SOURCE_SHEET, SourceFile=source_file,
             ExtraData=json.dumps(extra, ensure_ascii=False) if extra else None,
         )
@@ -267,6 +280,8 @@ def _merge_sql() -> str:
            "ELSE COALESCE(t.WebsiteDomain, s.WebsiteDomain) END",
            "t.VendorName = CASE WHEN t.LastEdited IS NULL THEN COALESCE(s.VendorName, t.VendorName) "
            "ELSE COALESCE(t.VendorName, s.VendorName) END",
+           "t.State = CASE WHEN t.LastEdited IS NULL THEN COALESCE(s.State, t.State) "
+           "ELSE COALESCE(t.State, s.State) END",
            "t.ScrapeStatus = s.ScrapeStatus",
            "t.SourceFile = COALESCE(s.SourceFile, t.SourceFile)",
            "t.ExtraData = COALESCE(s.ExtraData, t.ExtraData)",
@@ -286,7 +301,8 @@ OUTPUT $action;
 
 STAGE_SQL = """
 CREATE TABLE #stage (
-    RecordKey NVARCHAR(450) NOT NULL PRIMARY KEY, VendorName NVARCHAR(400), Website NVARCHAR(1000),
+    RecordKey NVARCHAR(450) NOT NULL PRIMARY KEY, VendorName NVARCHAR(400), State NVARCHAR(100),
+    Website NVARCHAR(1000),
     WebsiteDomain NVARCHAR(255), WebsiteSource NVARCHAR(100), ContactName NVARCHAR(1000),
     Email NVARCHAR(1000), Phone NVARCHAR(500), InsuranceOrBond NVARCHAR(MAX), ScrapeStatus NVARCHAR(500),
     PagesScraped NVARCHAR(MAX), Source NVARCHAR(50) NOT NULL, SourceFile NVARCHAR(255), ExtraData NVARCHAR(MAX)
@@ -340,7 +356,7 @@ def save_records(cfg: DbConfig, records: list[dict]) -> dict[str, int]:
 SOURCE_MANUAL = "Manual"
 
 # Columns the viewer lets people change
-EDITABLE_COLUMNS = ["VendorName", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes"]
+EDITABLE_COLUMNS = ["VendorName", "State", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes"]
 VIEW_COLUMNS = ["Id", *EDITABLE_COLUMNS, "WebsiteSource", "ScrapeStatus", "Source", "SourceFile", "ExtraData",
                 "FirstSeen", "LastScraped", "LastEdited", "LastEditedBy"]
 
