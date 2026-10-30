@@ -108,7 +108,9 @@ The database uses Azure SQL's free offer (100,000 vCore-seconds of compute and 3
 
 ## Hosted version
 
-The whole app (scraper and Database viewer) also runs on Azure at **https://contact-scraper-4b54ea.azurewebsites.net**, so you can use it from any device without installing anything.
+The whole app (scraper and Database viewer) also runs on Azure at **https://vendors.crosbyllc.com**, so you can use it from any device without installing anything. (The original address, https://contact-scraper-4b54ea.azurewebsites.net, still works.)
+
+- **Custom domain:** `vendors.crosbyllc.com` is a CNAME to the web app, plus an `asuid.vendors` TXT record that proves ownership, both in crosbyllc.com's DNS. HTTPS uses a free App Service managed certificate that Azure renews automatically. Both addresses are allowed as sign-in redirect URLs in the "Contact Scraper" app registration.
 
 - **Sign-in:** Microsoft sign-in is required. Anyone in the `Default Directory` tenant (members and guests) can open it; nobody gets in anonymously. Viewer edits are recorded under the signed-in person's name.
 - **Database access:** the web app signs in to Azure SQL with its own managed identity (`contact-scraper-4b54ea`, read/write only), so no password is stored. Its outbound IPs are allowed in the SQL firewall (`webapp-…` rules).
