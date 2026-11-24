@@ -739,6 +739,11 @@ def _phone_keys(value) -> set[str]:
     return {d[-10:] for d in (re.sub(r"\D", "", p) for p in re.split(r"[,;/]", str(value or ""))) if len(d) >= 10}
 
 
+def discovery_state_name(abbr: str | None) -> str:
+    import discovery
+    return discovery.STATES.get(abbr or "WA", abbr or "Washington")
+
+
 REDIVE_AFTER_DAYS = 30  # existing records deep-dived more recently than this aren't crawled again
 
 
@@ -754,27 +759,33 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
     try:
         cur = conn.cursor()
         cur.execute("SELECT Id, VendorName, Phone, UBI, VendorType, ContactName, Address, City, Zip, Region, "
-                    f"State, CASE WHEN EnrichedAt > DATEADD(day, -{REDIVE_AFTER_DAYS}, SYSUTCDATETIME()) "
+                    "State, WebsiteDomain, InsuranceOrBond, LicenseNumber, "
+                    f"CASE WHEN EnrichedAt > DATEADD(day, -{REDIVE_AFTER_DAYS}, SYSUTCDATETIME()) "
                     "THEN 1 ELSE 0 END FROM dbo.Vendors")
         cols = ["Id", "VendorName", "Phone", "UBI", "VendorType", "ContactName", "Address", "City", "Zip",
-                "Region", "State", "Fresh"]
+                "Region", "State", "WebsiteDomain", "InsuranceOrBond", "LicenseNumber", "Fresh"]
         existing = [dict(zip(cols, r)) for r in cur.fetchall()]
         by_ubi = {e["UBI"]: e for e in existing if e["UBI"]}
         by_name = {_name_key(e["VendorName"]): e for e in existing if e["VendorName"]}
         by_phone = {p: e for e in existing for p in _phone_keys(e["Phone"])}
+        by_domain = {e["WebsiteDomain"]: e for e in existing if e["WebsiteDomain"]}
 
         inserts, updates, seen = [], [], set()
         for it in items:
-            match = (by_ubi.get(it.ubi) if it.ubi else None) or by_name.get(_name_key(it.name)) \
+            state_name = discovery_state_name(it.state)
+            domain = _domain(it.website) if it.website else None
+            match = (by_ubi.get(it.ubi) if it.ubi else None) or (by_domain.get(domain) if domain else None) \
+                or by_name.get(_name_key(it.name)) \
                 or next((by_phone[p] for p in _phone_keys(it.phone) if p in by_phone), None)
             if match:
                 if match["Id"] in seen:
                     continue
                 seen.add(match["Id"])
-                fill = {"UBI": it.ubi, "LicenseNumber": it.license_number, "Region": it.region}
+                fill = {"UBI": it.ubi, "Region": it.region}
                 for col, val in (("VendorType", it.vendor_type), ("ContactName", it.owner),
                                  ("Address", it.address), ("City", it.city), ("Zip", it.zip),
-                                 ("State", "Washington")):
+                                 ("State", state_name), ("LicenseNumber", it.license_number),
+                                 ("InsuranceOrBond", it.insurance)):
                     if val and (match.get(col) is None or str(match.get(col)).strip() in GAP_VALUES + [""]):
                         fill[col] = val
                 if it.phone and not _phone_keys(match["Phone"]):
@@ -785,10 +796,12 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
                     continue
                 key = "vendor:" + _vendor_key(it.name)
                 inserts.append({
-                    "RecordKey": key[:450], "VendorName": it.name, "VendorType": it.vendor_type, "State": "Washington",
+                    "RecordKey": key[:450], "VendorName": it.name, "VendorType": it.vendor_type, "State": state_name,
                     "Phone": it.phone, "Address": it.address, "City": it.city, "Zip": it.zip, "Region": it.region,
                     "ContactName": it.owner, "UBI": it.ubi, "LicenseNumber": it.license_number, "Source": it.source,
-                    "ScanRunId": run_id, "EnrichmentStatus": "Pending",
+                    "Website": it.website, "WebsiteDomain": domain,
+                    "WebsiteSource": "Web search discovery" if it.website else None,
+                    "InsuranceOrBond": it.insurance, "ScanRunId": run_id, "EnrichmentStatus": "Pending",
                 })
                 by_name[_name_key(it.name)] = {"Id": None}  # avoid duplicate inserts within this batch
 

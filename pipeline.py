@@ -24,12 +24,13 @@ import enrich
 import routing
 from scraper import INSURANCE_UNKNOWN, crawl_site
 
-LOCAL_AREA_CODES = {"206", "253", "360", "425", "509", "564", "503", "971"}
+STATE_AREA_CODES = discovery.STATE_AREA_CODES
 
 
 @dataclass
 class ScanParams:
     trades: list[str]
+    state: str = "WA"
     custom_trades: list[str] = field(default_factory=list)
     area_presets: list[str] = field(default_factory=list)
     custom_areas: str = ""
@@ -86,7 +87,8 @@ def start(cfg: db.DbConfig, params: ScanParams, user: str | None) -> int:
         raise RuntimeError("A scan is already running; wait for it to finish or cancel it.")
     trades = params.trades + params.custom_trades
     run_id = db.create_run(cfg, StartedBy=user, Trades=", ".join(trades),
-                           Areas=", ".join(params.area_presets + ([params.custom_areas] if params.custom_areas else [])),
+                           Areas=f"{discovery.STATES.get(params.state, params.state)}: " + ", ".join(
+                               [a.strip() for a in params.area_presets] + ([params.custom_areas] if params.custom_areas else [])),
                            CriticalFields=", ".join(params.critical), Params=json.dumps(params.describe()),
                            Status="Running")
     _launch(cfg, run_id, params, discover=True)
@@ -146,10 +148,12 @@ def _run(cfg, run_id: int, params: ScanParams, state: RunState, discover: bool) 
             state.stage = "Stage 1: discovery"
             trades = [discovery.TRADES[t] for t in params.trades] + [discovery.custom_trade(t)
                                                                       for t in params.custom_trades]
-            area = discovery.build_area_filter(params.area_presets, params.custom_areas)
-            _log(cfg, state, f"Stage 1: searching the WA L&I contractor registry for {', '.join(t.label for t in trades)}"
-                             f" in {', '.join(area.labels) or 'all of WA'}", force=True)
-            items = discovery.discover_lni(trades, area, log=lambda m: _log(cfg, state, m))
+            area = discovery.build_area_filter(params.area_presets, params.custom_areas, params.state)
+            plan = "; ".join(f"{t.label}: {', '.join(discovery.sources_for(params.state, t))}" for t in trades)
+            _log(cfg, state, f"Stage 1: {discovery.STATES[params.state]}, {', '.join(area.labels)} ({plan})",
+                 force=True)
+            items = discovery.discover(params.state, trades, area, search=enrich.WebSearch(params.brave_key),
+                                       web_limit=params.max_new, log=lambda m: _log(cfg, state, m))
             _log(cfg, state, f"Stage 1: discovered {len(items)} unique businesses (duplicates across trades/areas merged)")
             new, matched, fresh = db.merge_discovered(cfg, run_id, items, limit=params.max_new)
             skipped = max(0, len(items) - matched - new)
@@ -228,9 +232,9 @@ def _digits(values) -> set[str]:
     return {re.sub(r"\D", "", p)[-10:] for p in values if len(re.sub(r"\D", "", p)) >= 10}
 
 
-def _best_phone(phones: list[str]) -> str | None:
+def _best_phone(phones: list[str], state: str = "WA") -> str | None:
     valid = [p for p in phones if checks.phone_is_valid(p)]
-    local = [p for p in valid if re.sub(r"\D", "", p)[-10:][:3] in LOCAL_AREA_CODES]
+    local = [p for p in valid if re.sub(r"\D", "", p)[-10:][:3] in STATE_AREA_CODES.get(state, set())]
     return (local or valid or [None])[0]
 
 
@@ -240,7 +244,9 @@ def deep_dive(rec: dict, search: enrich.WebSearch, critical: list[str], max_page
     if cancel is not None and cancel.is_set():
         return {"EnrichmentStatus": "Cancelled"}, "cancelled"
     vendor = rec["VendorName"] or ""
-    location = f"{rec.get('City') or ''} WA".strip()
+    abbr = discovery.STATE_ABBR.get(rec.get("State") or "", "WA")
+    place = rec.get("City") or " ".join(discovery.search_places_for(abbr, rec.get("Region"))[:3])
+    location = f"{place} {abbr}".strip()
     fields: dict = {}
     notes: list[str] = []
     result = None
@@ -284,7 +290,7 @@ def deep_dive(rec: dict, search: enrich.WebSearch, critical: list[str], max_page
             "InsuranceOrBond": "" if result.insurance_summary() == INSURANCE_UNKNOWN else result.insurance_summary(),
             "Address": next(iter(result.addresses), ""),
             "ServiceArea": next(iter(result.service_areas), ""),
-            "Phone": _best_phone(sorted(result.phones)) or "",
+            "Phone": _best_phone(sorted(result.phones), abbr) or "",
         }
         filled = [c for c, v in found.items() if v and _gap(rec.get(c))]
         fields.update({c: found[c] for c in filled})

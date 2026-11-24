@@ -218,7 +218,7 @@ DIRECTORY_DOMAINS |= {
     "rotorooter.com", "mrrooter.com", "nfl.com", "detroitlions.com", "pugetsystems.com",
     "findtrustedroofers.com", "findroofingpros.com", "washratings.com", "roofreport.net", "listcentral.us",
     "namesandnumbers.com", "provenexpert.com", "usbizs.com", "roof.info", "zoom.earth", "visitvancouverwa.com",
-    "101apartmentforrent.com", "roofmyspace.com", "clearme.com", "bizofwa.com",
+    "101apartmentforrent.com", "roofmyspace.com", "clearme.com", "bizofwa.com", "licensedhvactexas.com",
 }
 # Words in a domain that mark lead-gen/directory/listing sites rather than a vendor's own site
 DIRECTORY_WORDS = re.compile(
@@ -228,9 +228,17 @@ DIRECTORY_WORDS = re.compile(
 DIRECTORY_TITLE = re.compile(r"\b(top \d+|best \d+|\d+ best|directory|near me|list of|reviews? (of|for))\b", re.I)
 
 
+# Sites named after a trade itself (roofers.com, plumbers.com) are lead-generation directories
+TRADE_WORD_DOMAINS = {"roof", "roofer", "roofers", "roofing", "plumber", "plumbers", "plumbing", "gutter", "gutters",
+                      "electrician", "electricians", "hvac", "contractor", "contractors", "painters", "landscapers",
+                      "siding", "handyman", "homeservices", "localpros", "pros"}
+
+
 def _is_directory(url: str, title: str = "") -> bool:
     host = (urlparse(url).hostname or "").lower()
     reg = _registered_domain(host)
+    if reg.split(".")[0] in TRADE_WORD_DOMAINS:
+        return True
     if reg in DIRECTORY_DOMAINS or host.endswith((".gov", ".edu", ".org")) or "google." in host:
         return True
     return bool(DIRECTORY_WORDS.search(host) or DIRECTORY_TITLE.search(title))
@@ -357,7 +365,7 @@ def _bing_html(query: str) -> list[dict]:
     return out
 
 
-def _ddgs_lib(query: str) -> list[dict]:
+def _ddgs_lib(query: str, max_results: int = 10) -> list[dict]:
     try:
         from ddgs import DDGS
     except ImportError:
@@ -365,7 +373,7 @@ def _ddgs_lib(query: str) -> list[dict]:
             from duckduckgo_search import DDGS  # type: ignore  # older package name
         except ImportError as exc:
             raise SearchError("ddgs package not installed") from exc
-    results = DDGS().text(query, max_results=10, region="us-en")
+    results = DDGS().text(query, max_results=max_results, region="us-en")
     return [{"url": r.get("href", ""), "title": r.get("title", "")} for r in results or []]
 
 
@@ -412,7 +420,7 @@ class WebSearch:
     def _ddg(self, query: str) -> list[dict]:
         return _ddgs_lib(query)
 
-    def search(self, query: str) -> list[dict]:
+    def search(self, query: str, max_results: int = 10) -> list[dict]:
         errors = []
         for attempt in range(2):
             for name, engine in self.engines:
@@ -420,7 +428,7 @@ class WebSearch:
                     continue  # this engine keeps failing on this network; stop trying it
                 self._wait_turn()
                 try:
-                    results = (self._ddg(query) if name == "ddgs" else engine(query))
+                    results = (_ddgs_lib(query, max_results) if name == "ddgs" else engine(query))
                 except Exception as exc:  # noqa: BLE001 - try the next engine
                     with self._lock:
                         self.failures[name] = self.failures.get(name, 0) + 1
@@ -537,7 +545,7 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
 
 
 STATE_NAMES = {"WA": "Washington", "OR": "Oregon", "ID": "Idaho", "CA": "California", "MT": "Montana",
-               "NV": "Nevada", "AZ": "Arizona", "UT": "Utah", "TX": "Texas", "CO": "Colorado"}
+               "NV": "Nevada", "AZ": "Arizona", "UT": "Utah", "TX": "Texas", "CO": "Colorado", "OK": "Oklahoma"}
 TRADE_STEMS = ["roof", "plumb", "gutter", "drain", "sewer", "rooter", "septic", "siding", "construct",
                "heating", "hvac", "water heater", "pipe", "leak", "remodel", "contractor"]
 

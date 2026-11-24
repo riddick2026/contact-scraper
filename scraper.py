@@ -280,6 +280,8 @@ def _clean_email(email: str) -> str | None:
     local = email.split("@", 1)[0]
     if EMAIL_JUNK_LOCAL.match(local):
         return None
+    if domain.endswith((".gov", ".mil")) or ".state." in domain:
+        return None  # licensing agencies etc. are never the vendor's own address
     if len(local) >= 24 and re.fullmatch(r"[0-9a-f]+", local):
         return None
     return email

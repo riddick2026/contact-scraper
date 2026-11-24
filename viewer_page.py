@@ -298,7 +298,8 @@ search = f1.text_input("Search", placeholder="Vendor, email, phone, website, not
 show = f2.selectbox("Show", list(FILTERS))
 picked = multiselect_filter(f3, "Added from", df_all["Source"])
 
-g1, g2, g3, g4 = st.columns(4)
+g0, g1, g2, g3, g4 = st.columns(5)
+picked_states = multiselect_filter(g0, "State", df_all["State"], list(discovery.STATES.values()))
 picked_types = multiselect_filter(g1, "Vendor type", df_all["VendorType"],
                                   list(dict.fromkeys([*enrich.VENDOR_TYPES,
                                                       *(t.vendor_type for t in discovery.TRADES.values())])))
@@ -313,7 +314,7 @@ select_all = s3.checkbox("Select all shown", help="Tick every record in the curr
 
 view = FILTERS[show](df_all if queue_view is None else df_all[df_all["Queue"] == queue_view])
 view = view[in_choices(view["Source"], picked) & in_choices(view["VendorType"], picked_types)
-            & in_choices(view["Region"], picked_regions)
+            & in_choices(view["Region"], picked_regions) & in_choices(view["State"], picked_states)
             & in_choices(view["Onboarded"], picked_onboarded) & in_choices(view["LiabilityInsurance"], picked_liability)]
 if search.strip():
     text = view[["VendorName", "VendorType", "State", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond",
@@ -326,7 +327,8 @@ st.caption("Click a cell to edit it. Tick ✔ to select records for **Rescan**, 
            "the empty last row; select rows by their left edge and press Delete to remove them. Nothing is written "
            "until you click **Save changes**. Changing the search, filters or sort discards unsaved edits.")
 
-view_key = "|".join(map(str, (queue_view, show, search, picked, picked_types, picked_regions, picked_onboarded,
+view_key = "|".join(map(str, (queue_view, show, search, picked, picked_states, picked_types, picked_regions,
+                                picked_onboarded,
                                 picked_liability,
                                 sort_label, descending, select_all)))
 editor_key = f"editor-{st.session_state.viewer_token}-{hash(view_key)}"

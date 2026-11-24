@@ -4,14 +4,31 @@ An end-to-end vendor discovery tool: pick trades and areas, and it finds license
 
 ## Scan (🛰️ the home page)
 
-1. **Trades:** Roofing, Gutters, Plumbing, HVAC, Electrical, Siding, Painting, Landscaping, plus any other trade typed in.
-2. **Areas:** region presets (Western WA / Puget Sound and its submarkets, Southern WA / Vancouver, Eastern WA / Spokane, Central WA, Tri-Cities) and/or custom cities, ZIPs or 3-digit ZIP prefixes. Presets are ZIP-prefix based, so every town in a region is included.
-3. **Critical fields:** which fields a record needs to be in the Primary queue (default: Business name, Website, Phone, Valid email). The choice is saved and used everywhere routing happens.
-4. **Estimate** shows how many active licenses match and roughly how long a scan takes; **Start scan** runs it.
+1. **State:** Washington, Oregon, Idaho, Texas or Oklahoma. The areas and data sources change with it.
+2. **Trades:** Roofing, Gutters, Plumbing, HVAC, Electrical, Siding, Painting, Landscaping, plus any other trade typed in. Under the trades, the page shows which source each one will use in the chosen state.
+3. **Areas:** that state's region presets (with submarkets) and/or custom cities, ZIPs or 3-digit ZIP prefixes. Registry regions are ZIP- or county-based, so every town in them is included; web-search regions search the region's main cities.
+4. **Critical fields:** which fields a record needs to be in the Primary queue (default: Business name, Website, Phone, Valid email). The choice is saved and used everywhere routing happens.
+5. **Estimate** shows how many active licenses match (or that web search is used) and roughly how long a scan takes; **Start scan** runs it.
+
+### Where businesses come from (Stage 1)
+
+Each state uses its official, free contractor-license data where it exists, and web-search discovery where it doesn't:
+
+| State | Source | Trades | Comes with |
+|---|---|---|---|
+| Washington | [L&I contractor registry](https://data.wa.gov/Labor/L-I-Contractor-License-Data-General/m8qx-ubtq) (daily) | all (license specialty/type, or the trade in the business name) | phone, address, owner, license #, UBI |
+| Oregon | [CCB active licenses](https://data.oregon.gov/Business/CCB-Active-Licenses/g77e-6bhs) (daily) + [Building Codes Division licenses](https://data.oregon.gov/Business/Building-Codes-Division-Active-Contractor-Individual-L/vhbr-cuaq) | all (trade in the business name); BCD adds plumbing, electrical and HVAC contractors | phone, address, owner, license #, **liability insurance and bond** |
+| Texas | [TDLR licenses](https://data.texas.gov/dataset/TDLR-All-Licenses/7358-krk7) | HVAC (A/C contractors), Electrical | owner, county; electrical also phone and address |
+| Texas | [TSBPE Responsible Master Plumbers](https://tsbpe.texas.gov/free-licensee-list/) (daily CSV) | Plumbing | phone, address, owner, **liability insurance** |
+| Texas | web search | everything else (Texas doesn't license roofers or gutter installers) | website, phone |
+| Idaho | web search | all (DOPL's list is behind an interactive form, not a data feed) | website, phone |
+| Oklahoma | web search | all (CIB offers lookups only, no bulk list) | website, phone |
+
+**Web-search discovery** searches several phrasings of "[trade] [city], [state]" for each city in the chosen regions (excluding Yelp, Angi, BBB and similar directories), then opens each result's homepage and keeps it only if it's about the trade, names a city in the area (or the state with a ZIP), and its phone numbers are local. Lead-generation networks (several sites sharing one phone number) are collapsed to one. It finds businesses that have a website, which tend to land in Primary, but fewer than a registry, and search engines return somewhat different results each run: re-running a web-search scan finds more without creating duplicates.
 
 The scan then runs on its own, with a live log and progress counters:
 
-- **Stage 1: discovery.** Queries the [Washington L&I contractor registry](https://data.wa.gov/Labor/L-I-Contractor-License-Data-General/m8qx-ubtq) (public, updated daily) for active licenses matching the trades (by license specialty or type, or a trade word in the business name) in the areas. Each business comes with its name, phone, address, owner and license number. Duplicates across trades and areas are merged by state business ID (UBI), and businesses already in the database (same UBI, name or phone) are merged into the existing record (only empty fields are filled). New records are saved immediately as *Pending*. **Max new businesses per scan** (Advanced) caps how many new ones one scan adds.
+- **Stage 1: discovery.** Pulls businesses from the state's sources (above). Duplicates across trades and areas are merged by state business ID (UBI), and businesses already in the database (same UBI, name or phone) are merged into the existing record (only empty fields are filled). New records are saved immediately as *Pending*. **Max new businesses per scan** (Advanced) caps how many new ones one scan adds.
 - **Stage 2: deep dive.** For every record from Stage 1: if there's no website, a web search finds one, and it's only accepted if the site carries the registry's phone number or mentions the vendor's name, trade and area (directories, lookalikes and redirecting domains are rejected). Then up to 6 pages per site are crawled (home, contact, about, team, service areas, licensing, services, including footer links) for emails (third-party, tracking and placeholder addresses filtered out), phone numbers, contact names, street address, service area and insurance/licence claims. Found emails are checked, and the record is routed. Only empty fields are ever filled.
 - **Routing:** records with every critical field go to **Primary**; the rest go to **Secondary** with the missing fields listed (`[NO DOMAIN FOUND]`, `[MISSING: EMAIL]`, `[INVALID EMAIL]`, ...). Secondary records are never deleted automatically.
 
@@ -56,9 +73,9 @@ Open **🗂️ Database viewer** in the app's sidebar to browse and update the s
 - **⬆️ Promote / ⬇️ Demote** move selected records between queues by hand; they stay there (marked *Moved by hand*) until **↺ Auto-route** hands them back to automatic routing. Editing a record (say, typing in an email you found) re-routes it automatically.
 - **📤 Export queues:** Primary only, Secondary only, or All records with `Queue_Status` and `Missing_Fields` columns, as Excel or CSV. Exports cover the whole queue; **Download this view** exports just the filtered grid.
 
-- **Search** across vendor, type, website, contact, email, phone, insurance and notes.
+- **Search** across vendor, type, website, contact, email, phone, address, insurance and notes.
 - **Show** quick filters: no email, valid phone number, no valid phone number, missing contact name or insurance, email problems, emails not checked yet, website needs checking, edited by hand.
-- **Filter** by Added from (spreadsheet, URL list, manual), **Vendor type**, **Onboarded** and **Liability insurance**.
+- **Filter** by Added from (registry, web search, spreadsheet, manual), **State**, **Vendor type**, **Region**, **Onboarded** and **Liability insurance**. An empty filter means all.
 - **Sort by** any column, ascending or descending, on top of any filter. The default is last activity, newest first.
 - **Edit** a cell by clicking it (press Enter to open it, Enter again to keep the change). Vendor, vendor type, state, onboarded, liability insurance, website, contact name, email, phone, insurance or bond, and notes are editable; dates and scrape details are read-only.
 - **Select** records with the ✔ column (or **Select all shown**), then:
@@ -177,7 +194,7 @@ Install spaCy and its English model; the scraper uses it automatically when pres
 - `app.py`: entry point, page navigation and the TEST banner
 - `scan_page.py`: Scan page (scan settings, estimate, live progress, history, resume)
 - `pipeline.py`: the background scan pipeline (Stage 1, Stage 2 deep dive, routing, resume)
-- `discovery.py`: Stage 1 sources (WA L&I registry), trades and area presets
+- `discovery.py`: Stage 1 sources per state (WA, OR, TX registries; web-search discovery), trades and area presets
 - `routing.py`: critical fields and Primary/Secondary routing
 - `migrate.py`: brings a database's structure up to date (run by deploy.sh)
 - `deploy.sh`: deploys the committed code to the test or production web app

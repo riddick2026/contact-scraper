@@ -13,9 +13,10 @@ import pipeline
 import routing
 
 st.title("🛰️ Scan for vendors")
-st.caption("Finds licensed businesses for the trades and areas you pick (Washington L&I contractor registry), "
-           "crawls each one's website for contact details, and sorts them into the **Primary** queue (all critical "
-           "fields found) or the **Secondary** queue (something missing). Results are saved as they come in.")
+st.caption("Finds businesses for the trades and areas you pick (from each state's contractor license data where it "
+           "exists, otherwise by web search), crawls each one's website for contact details, and sorts them into the "
+           "**Primary** queue (all critical fields found) or the **Secondary** queue (something missing). Results are "
+           "saved as they come in.")
 
 try:
     cfg = db.load_config()
@@ -38,9 +39,9 @@ user = st.context.headers.get("X-Ms-Client-Principal-Name")
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def estimate(trades: tuple, customs: tuple, presets: tuple, custom_areas: str) -> dict:
+def estimate(state: str, trades: tuple, customs: tuple, presets: tuple, custom_areas: str) -> dict:
     ts = [discovery.TRADES[t] for t in trades] + [discovery.custom_trade(c) for c in customs]
-    return discovery.count_lni(ts, discovery.build_area_filter(list(presets), custom_areas))
+    return discovery.count_registry(state, ts, discovery.build_area_filter(list(presets), custom_areas, state))
 
 
 def last_params() -> dict:
@@ -91,6 +92,10 @@ saved_critical = db.critical_fields(cfg)
 
 with st.container(border=True):
     st.subheader("New scan")
+    states = list(discovery.STATES)
+    scan_state = st.selectbox("State", states, index=states.index(prev.get("state", "WA")) if prev.get("state", "WA")
+                              in states else 0, format_func=lambda s: discovery.STATES[s],
+                              help="Areas and data sources change with the state.")
     c1, c2 = st.columns(2)
     trades = c1.multiselect("Trades", list(discovery.TRADES),
                             default=[t for t in prev.get("trades", ["Roofing", "Gutters"]) if t in discovery.TRADES])
@@ -98,13 +103,23 @@ with st.container(border=True):
         "Other trades (optional)", value=", ".join(prev.get("custom_trades", [])),
         placeholder="e.g. Fencing, Window cleaning",
         help="Matched against business names and license specialties.").split(",") if t.strip()]
-    presets = c2.multiselect("Areas", list(discovery.AREA_PRESETS),
-                             default=[a for a in prev.get("area_presets", []) if a in discovery.AREA_PRESETS],
+    chosen = [discovery.TRADES[t] for t in trades] + [discovery.custom_trade(t) for t in custom_trades]
+    if chosen:
+        c1.caption("**Sources:** " + " · ".join(
+            f"{t.label}: {' + '.join(discovery.sources_for(scan_state, t))}" for t in chosen)
+            + ("  \n*Web search* finds businesses with a website; it's used where the state has no usable "
+               "license data for that trade." if any(discovery.sources_for(scan_state, t) == [discovery.SOURCE_WEB]
+                                                   for t in chosen) else ""))
+    state_presets = discovery.AREA_PRESETS[scan_state]
+    presets = c2.multiselect(f"Areas in {discovery.STATES[scan_state]}", list(state_presets), key=f"areas-{scan_state}",
+                             default=[a for a in prev.get("area_presets", []) if a in state_presets],
                              format_func=lambda a: a.strip(),
-                             help="Regions are ZIP-code based, so every town in them is included. "
-                                  "Indented entries are submarkets.")
-    custom_areas = c2.text_input("Other cities or ZIPs (optional)", value=prev.get("custom_areas", ""),
-                                 placeholder="e.g. Spokane, Camas, 98604, 993",
+                             help="Regions cover every town in them (by ZIP code or county). Indented entries are "
+                                  "submarkets. Web-search scans search the region's main cities.")
+    custom_areas = c2.text_input("Other cities or ZIPs (optional)", key=f"custom-areas-{scan_state}",
+                                 value=prev.get("custom_areas", "") if prev.get("state", "WA") == scan_state else "",
+                                 placeholder="e.g. Spokane, Camas, 98604, 993" if scan_state == "WA" else
+                                 "City names or ZIPs, comma-separated",
                                  help="City names, 5-digit ZIPs, or 3-digit ZIP prefixes, separated by commas.")
     critical = st.multiselect(
         "Critical fields (a record needs all of these to be in the Primary queue)",
@@ -125,17 +140,21 @@ with st.container(border=True):
     if b1.button("🔍 Estimate", disabled=not ready, width="stretch"):
         try:
             with st.spinner("Counting licensed businesses…"):
-                counts = estimate(tuple(trades), tuple(custom_trades), tuple(presets), custom_areas)
-            total = sum(counts.values())
+                counts = estimate(scan_state, tuple(trades), tuple(custom_trades), tuple(presets), custom_areas)
+            total = sum(int(v.split()[0]) for v in counts.values() if v.split()[0].isdigit())
+            web = any(not v.split()[0].isdigit() for v in counts.values())
+            expect = max_new if web else min(total, max_new)
             st.info(" · ".join(f"**{k}**: {v}" for k, v in counts.items())
-                    + f"  \nAbout **{total}** active licenses (before merging duplicates and records you already "
-                      f"have). This scan would add up to **{min(total, max_new)}** new businesses; at ~10 s each "
-                      f"with {workers} at a time, roughly **{max(1, round(min(total, max_new) * 10 / workers / 60))} "
-                      f"min**.")
+                    + (f"  \nAbout **{total}** active licenses (before merging duplicates and records you already "
+                       f"have)." if total else "")
+                    + (" Web search finds an unknown number in advance." if web else "")
+                    + f"  \nThis scan adds up to **{expect}** new businesses; at ~10 s each with {workers} at a time, "
+                      f"roughly **{max(1, round(expect * 10 / workers / 60))} min**"
+                    + (" (plus a few minutes of web searching)." if web else "."))
         except Exception as exc:  # noqa: BLE001
             st.error(f"Couldn't reach the L&I registry: {exc}")
     if b2.button("▶ Start scan", type="primary", disabled=not ready, width="stretch"):
-        params = pipeline.ScanParams(trades=trades, custom_trades=custom_trades, area_presets=presets,
+        params = pipeline.ScanParams(trades=trades, state=scan_state, custom_trades=custom_trades, area_presets=presets,
                                      custom_areas=custom_areas.strip(), critical=critical, max_new=int(max_new),
                                      workers=int(workers), max_pages=int(max_pages), brave_key=brave_key)
         try:
