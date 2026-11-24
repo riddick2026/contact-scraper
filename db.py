@@ -132,6 +132,17 @@ def load_config() -> DbConfig | None:
     return DbConfig(server=server, database=database, authentication=auth)
 
 
+def app_environment() -> str:
+    """'production' unless APP_ENVIRONMENT or secrets.toml's [app] environment says otherwise (e.g. 'test')."""
+    env = os.environ.get("APP_ENVIRONMENT", "")
+    if not env and SECRETS_FILE.exists():
+        try:
+            env = tomllib.loads(SECRETS_FILE.read_text()).get("app", {}).get("environment", "")
+        except tomllib.TOMLDecodeError:
+            env = ""
+    return (env or "production").strip().lower()
+
+
 def _friendly(exc: Exception) -> str:
     msg = str(exc)
     if "40615" in msg or re.search(r"Client with IP address '[\d.]+' is not allowed", msg):
