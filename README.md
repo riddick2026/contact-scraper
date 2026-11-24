@@ -32,6 +32,8 @@ The scan then runs on its own, with a live log and progress counters:
 - **Stage 2: deep dive.** For every record from Stage 1: if there's no website, a web search finds one, and it's only accepted if the site carries the registry's phone number or mentions the vendor's name, trade and area (directories, lookalikes and redirecting domains are rejected). Then up to 6 pages per site are crawled (home, contact, about, team, service areas, licensing, services, including footer links) for emails (third-party, tracking and placeholder addresses filtered out), phone numbers, contact names, street address, service area and insurance/licence claims. Found emails are checked, and the record is routed. Only empty fields are ever filled.
 - **Routing:** records with every critical field go to **Primary**; the rest go to **Secondary** with the missing fields listed (`[NO DOMAIN FOUND]`, `[MISSING: EMAIL]`, `[INVALID EMAIL]`, ...). Secondary records are never deleted automatically.
 
+When a scan finishes, **its results appear at the bottom of the Scan page**: every business that scan found (marked *New* or *Already in database*), with Primary/Secondary counts and a queue switcher, editable in place, with the same Save, Rescan, Check emails, Promote/Demote/Auto-route and export tools as the Database viewer. Pick an earlier scan under Recent scans to work with its results instead; a business found again by a later scan appears in both scans' results.
+
 Each record is saved as soon as its deep dive finishes, so timeouts, blocked sites and broken pages never lose progress. Scans run in the background: closing the browser tab doesn't stop them. **Cancel** stops after the records in progress; a scan interrupted by an app restart or cancelled can be **resumed** from Recent scans, which also keeps each scan's settings, counts and full log.
 
 Website search uses free engines (DuckDuckGo, then Bing). For big scans, add a free **Brave Search API key** under Advanced for faster, more reliable lookups. Some sites block automated visits; those are logged as unreachable rather than worked around.
@@ -200,6 +202,7 @@ Install spaCy and its English model; the scraper uses it automatically when pres
 - `deploy.sh`: deploys the committed code to the test or production web app
 - `refresh_test_db.py`: replaces the test database's records with a copy of production's
 - `viewer_page.py`: Database viewer (queues, browse, filter, sort, edit, add, delete, rescan, email check, promote/demote, exports)
+- `records_ui.py`: the editing, rescan, email-check, queue and export tools shared by the viewer and the Scan page's results panel
 - `checks.py`: phone number validity and email deliverability checks
 - `enrich.py`: website search and verification, vendor types, name cleaning
 - `db.py`: Azure SQL storage (connection, `dbo.Vendors` table, save/update logic, viewer reads and edits)

@@ -66,6 +66,7 @@ def evaluate(record: dict, critical: list[str]) -> tuple[str, str, int]:
         test, label = CRITICAL_FIELDS[name]
         if not test(record):
             missing.append(label(record) if callable(label) else label)
+    missing = list(dict.fromkeys(missing))  # "Email" and "Valid email" both report a missing email
     score = round(100 * sum(CRITICAL_FIELDS[n][0](record) for n in SCORED) / len(SCORED))
     return (PRIMARY if not missing else SECONDARY), " ".join(missing), score
 

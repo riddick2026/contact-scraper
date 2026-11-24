@@ -10,6 +10,7 @@ import streamlit as st
 import db
 import discovery
 import pipeline
+import records_ui as ui
 import routing
 
 st.title("🛰️ Scan for vendors")
@@ -60,6 +61,7 @@ def last_params() -> dict:
 def live_panel(run_id: int) -> None:
     state = pipeline.get_state(run_id)
     if state is None or state.finished:
+        st.session_state.scan_finished = run_id
         st.rerun(scope="app")
         return
     st.subheader(f"Scan #{run_id} running · {state.stage}")
@@ -76,6 +78,9 @@ def live_panel(run_id: int) -> None:
         pipeline.cancel(run_id)
         st.toast("Cancelling… records in progress will finish first.")
 
+
+if (finished := st.session_state.pop("scan_finished", None)) is not None:
+    st.success(f"✅ Scan #{finished} finished. Its results are at the bottom of this page.")
 
 active = pipeline.active_run()
 if active:
@@ -186,7 +191,8 @@ show = runs.drop(columns=["Params"]).rename(columns={
 st.dataframe(show, hide_index=True, width="stretch")
 
 h1, h2 = st.columns([1, 3])
-pick = h1.selectbox("Scan", runs["Id"].tolist(), format_func=lambda i: f"#{i}")
+pick = h1.selectbox("Scan", runs["Id"].tolist(), format_func=lambda i: f"#{i}",
+                    help="Pick a scan to resume it, read its log, or work with its results below.")
 row = runs[runs["Id"] == pick].iloc[0]
 with h2:
     if row["Status"] in ("Interrupted", "Cancelled", "Failed"):
@@ -201,3 +207,88 @@ with h2:
                 st.error(str(exc))
 with st.expander(f"Log for scan #{pick}"):
     st.code(db.get_run_log(cfg, int(pick)) or "(empty)", language=None, height=360)
+
+
+# --------------------------------------------------------------------------- #
+# Results of the selected scan
+# --------------------------------------------------------------------------- #
+
+PANEL_COLUMNS = ["Queue", "MissingFields", "ScanOutcome", "VendorName", "VendorType", "Phone", "Email", "Website",
+                 "ContactName", "City", "Address", "CompletionScore", "InsuranceOrBond", "ServiceArea", "Region",
+                 "Onboarded", "LiabilityInsurance", "Notes", "EmailStatus", "LicenseNumber", "Id"]
+
+
+def load_results(run_id: int) -> None:
+    with st.spinner("Loading this scan's results…"):
+        df, versions = db.load_vendors(cfg, scan_run_id=run_id)
+        outcomes = db.scan_outcomes(cfg, run_id)
+    df.insert(0, "ScanOutcome", df["Id"].map(outcomes))
+    st.session_state.scan_results = {"run": run_id, "df": df, "versions": versions,
+                                     "token": st.session_state.get("scan_results", {}).get("token", 0) + 1}
+
+
+def notify(kind: str, message: str) -> None:
+    st.session_state.scan_message = (kind, message)
+
+
+st.divider()
+st.subheader(f"Results of scan #{pick}")
+results = st.session_state.get("scan_results")
+if not results or results["run"] != pick:
+    try:
+        load_results(int(pick))
+    except db.DbError as exc:
+        st.error(f"Couldn't load results: {exc}")
+        st.stop()
+    results = st.session_state.scan_results
+df_scan: pd.DataFrame = results["df"]
+
+if msg := st.session_state.pop("scan_message", None):
+    getattr(st, msg[0])(msg[1])
+
+if df_scan.empty:
+    st.caption("No records are linked to this scan. (Scans from before scan tracking was added only keep the "
+               "records they were the last to touch; later scans of the same area take over the rest.)")
+    st.page_link("viewer_page.py", label="Open the Database viewer for all records", icon="🗂️")
+    st.stop()
+
+n_new = int((df_scan["ScanOutcome"] == "New").sum())
+n_primary = int((df_scan["Queue"] == routing.PRIMARY).sum())
+m = st.columns(5)
+m[0].metric("Businesses", len(df_scan))
+m[1].metric("New", n_new)
+m[2].metric("Already in database", len(df_scan) - n_new)
+m[3].metric("Primary", n_primary)
+m[4].metric("Secondary", len(df_scan) - n_primary)
+
+r1, r2, r3 = st.columns([3, 1.4, 1], vertical_alignment="bottom")
+views = {"All": None, f"Primary ({n_primary})": routing.PRIMARY,
+         f"Secondary ({len(df_scan) - n_primary})": routing.SECONDARY}
+queue_label = r1.segmented_control("Queue", list(views), default="All", key="scan-queue",
+                                   label_visibility="collapsed")
+select_all = r2.checkbox("Select all shown", key="scan-select-all")
+if r3.button("🔄 Reload", key="scan-reload", width="stretch", help="Fetch the latest data (discards unsaved edits)."):
+    load_results(int(pick))
+    st.rerun()
+
+queue_view = views.get(queue_label or "All")
+view = (df_scan if queue_view is None else df_scan[df_scan["Queue"] == queue_view]).reset_index(drop=True)
+view.insert(0, "Select", select_all)
+config = ui.column_config(df_scan) | {"ScanOutcome": st.column_config.TextColumn(
+    "This scan", width="small", help="New to the database, or already there (gaps filled)")}
+edited = st.data_editor(
+    view,
+    key=f"scan-editor-{pick}-{results['token']}-{queue_view}-{select_all}",
+    column_config=config,
+    column_order=["Select", *PANEL_COLUMNS],
+    disabled=[c for c in view.columns if c not in db.EDITABLE_COLUMNS and c != "Select"],
+    hide_index=True,
+    height=min(520, 38 + 35 * (len(view) + 1)),
+)
+st.caption("Click a cell to edit it; tick ✔ to rescan, check emails or move records between queues. Nothing is "
+           "written until you click **Save changes**. Records found by a later scan move to that scan's results.")
+ui.record_tools(cfg, view, edited, results["versions"], user, notify, lambda: load_results(int(pick)),
+                key="scan", allow_delete=False)
+with st.expander(f"📤 Export scan #{pick}'s results"):
+    ui.export_buttons(df_scan, key="scan", name=f"scan{pick}")
+st.page_link("viewer_page.py", label="Open the Database viewer for all records, filters and search", icon="🗂️")

@@ -33,6 +33,12 @@ def main(database: str) -> None:
             cur.executemany("UPDATE dbo.Vendors SET EmailStatus = ?, EmailCheckedAt = ? WHERE Id = ?",
                             [[s, now, r[0]] for r, s in zip(rows, statuses)])
             conn.commit()
+        # Scans from before ScanRunRecords existed: remember at least each record's latest scan
+        cur.execute("INSERT INTO dbo.ScanRunRecords (ScanRunId, VendorId, Outcome) SELECT v.ScanRunId, v.Id, "
+                    "CASE WHEN v.FirstSeen >= r.StartedAt THEN N'New' ELSE N'Already in database' END "
+                    "FROM dbo.Vendors v JOIN dbo.ScanRuns r ON r.Id = v.ScanRunId WHERE NOT EXISTS "
+                    "(SELECT 1 FROM dbo.ScanRunRecords x WHERE x.ScanRunId = v.ScanRunId AND x.VendorId = v.Id)")
+        conn.commit()
         cur.execute("SELECT Id FROM dbo.Vendors WHERE CompletionScore IS NULL")
         unrouted = [int(r[0]) for r in cur.fetchall()]
     finally:

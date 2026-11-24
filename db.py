@@ -120,6 +120,13 @@ IF OBJECT_ID(N'dbo.ScanRuns', N'U') IS NULL
         PrimaryCount   INT NULL, SecondaryCount INT NULL,
         Log            NVARCHAR(MAX) NULL
     );
+IF OBJECT_ID(N'dbo.ScanRunRecords', N'U') IS NULL
+    CREATE TABLE dbo.ScanRunRecords (          -- every business each scan found (records keep only the last scan)
+        ScanRunId INT NOT NULL,
+        VendorId  INT NOT NULL,
+        Outcome   NVARCHAR(30) NOT NULL,       -- New / Already in database / Already in database (recent)
+        CONSTRAINT PK_ScanRunRecords PRIMARY KEY (ScanRunId, VendorId)
+    );
 IF OBJECT_ID(N'dbo.AppSettings', N'U') IS NULL
     CREATE TABLE dbo.AppSettings (Name NVARCHAR(100) NOT NULL CONSTRAINT PK_AppSettings PRIMARY KEY,
                                   Value NVARCHAR(MAX) NULL);
@@ -444,14 +451,17 @@ class ChangeResult:
     conflicts: list[str] | None = None  # rows changed by someone else since loading
 
 
-def load_vendors(cfg: DbConfig) -> tuple[pd.DataFrame, dict[int, bytes]]:
-    """All saved records, newest activity first, plus each row's version stamp by Id."""
+def load_vendors(cfg: DbConfig, scan_run_id: int | None = None) -> tuple[pd.DataFrame, dict[int, bytes]]:
+    """Saved records (all, or those from one scan), newest activity first, plus each row's version stamp by Id."""
     conn = connect(cfg)
     try:
         ensure_schema(conn)
         cur = conn.cursor()
-        cur.execute(f"SELECT {', '.join(VIEW_COLUMNS)}, RowVer FROM dbo.Vendors "
-                    "ORDER BY COALESCE(LastEdited, LastScraped) DESC, Id DESC")
+        where = ("WHERE Id IN (SELECT VendorId FROM dbo.ScanRunRecords WHERE ScanRunId = ?) "
+                 if scan_run_id is not None else "")
+        cur.execute(f"SELECT {', '.join(VIEW_COLUMNS)}, RowVer FROM dbo.Vendors {where}"
+                    "ORDER BY COALESCE(LastEdited, LastScraped) DESC, Id DESC",
+                    [int(scan_run_id)] if scan_run_id is not None else [])
         rows = cur.fetchall()
     except DbError:
         raise
@@ -806,6 +816,8 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
                 by_name[_name_key(it.name)] = {"Id": None}  # avoid duplicate inserts within this batch
 
         fresh_ids = {e["Id"] for e in existing if e["Fresh"]}
+        members = {rec_id: ("Already in database (recent)" if rec_id in fresh_ids else "Already in database")
+                   for rec_id, _ in updates}
         for rec_id, fill in updates:
             fill["ScanRunId"] = run_id
             if rec_id not in fresh_ids:
@@ -818,6 +830,15 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
                 f"INSERT INTO dbo.Vendors ({', '.join(cols)}) SELECT {', '.join('?' * len(cols))} "
                 f"WHERE NOT EXISTS (SELECT 1 FROM dbo.Vendors WHERE RecordKey = ?)",
                 [[r[c] for c in cols] + [r["RecordKey"]] for r in inserts])
+            keys = [r["RecordKey"] for r in inserts]
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
+                cur.execute(f"SELECT Id FROM dbo.Vendors WHERE RecordKey IN ({', '.join('?' * len(chunk))})", chunk)
+                members.update({int(r[0]): "New" for r in cur.fetchall()})
+        if members:
+            cur.executemany("INSERT INTO dbo.ScanRunRecords (ScanRunId, VendorId, Outcome) SELECT ?, ?, ? WHERE NOT "
+                            "EXISTS (SELECT 1 FROM dbo.ScanRunRecords WHERE ScanRunId = ? AND VendorId = ?)",
+                            [[run_id, vid, outcome, run_id, vid] for vid, outcome in members.items()])
         conn.commit()
         return len(inserts), len(updates), sum(1 for rec_id, _ in updates if rec_id in fresh_ids)
     except Exception as exc:  # noqa: BLE001
@@ -915,5 +936,16 @@ def reroute(cfg: DbConfig, ids: list[int] | None = None, critical: list[str] | N
                         params)
         conn.commit()
         return counts
+    finally:
+        conn.close()
+
+
+def scan_outcomes(cfg: DbConfig, run_id: int) -> dict[int, str]:
+    """{record Id: 'New' / 'Already in database' / ...} for the businesses a scan found."""
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT VendorId, Outcome FROM dbo.ScanRunRecords WHERE ScanRunId = ?", [run_id])
+        return {int(r[0]): r[1] for r in cur.fetchall()}
     finally:
         conn.close()
