@@ -37,7 +37,7 @@ SOURCE_URLS = "URL list"
 GAP_VALUES = sorted(enrich.PLACEHOLDERS | {INSURANCE_UNKNOWN, enrich.SRC_NONE, enrich.SRC_NO_NAME})
 
 # Columns written by a save, in staging/insert order
-FIELDS = ["RecordKey", "VendorName", "State", "Website", "WebsiteDomain", "WebsiteSource", "ContactName", "Email",
+FIELDS = ["RecordKey", "VendorName", "VendorType", "State", "Website", "WebsiteDomain", "WebsiteSource", "ContactName", "Email",
           "Phone", "InsuranceOrBond", "ScrapeStatus", "PagesScraped", "Source", "SourceFile", "ExtraData"]
 # Scraped values that follow the "real value beats gap marker" rule
 DATA_COLUMNS = ["Website", "WebsiteSource", "ContactName", "Email", "Phone", "InsuranceOrBond", "PagesScraped"]
@@ -74,7 +74,25 @@ END
 -- Columns added after the table was first created
 IF COL_LENGTH(N'dbo.Vendors', N'State') IS NULL
     ALTER TABLE dbo.Vendors ADD State NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.Vendors', N'VendorType') IS NULL
+    ALTER TABLE dbo.Vendors ADD VendorType NVARCHAR(50) NULL;
+-- NOT NULL + DEFAULT fills existing rows with the default
+IF COL_LENGTH(N'dbo.Vendors', N'Onboarded') IS NULL
+    ALTER TABLE dbo.Vendors ADD Onboarded NVARCHAR(20) NOT NULL
+        CONSTRAINT DF_Vendors_Onboarded DEFAULT N'No'
+        CONSTRAINT CK_Vendors_Onboarded CHECK (Onboarded IN (N'Yes', N'No', N'In process'));
+IF COL_LENGTH(N'dbo.Vendors', N'LiabilityInsurance') IS NULL
+    ALTER TABLE dbo.Vendors ADD LiabilityInsurance NVARCHAR(20) NOT NULL
+        CONSTRAINT DF_Vendors_LiabilityInsurance DEFAULT N'Unknown'
+        CONSTRAINT CK_Vendors_LiabilityInsurance CHECK (LiabilityInsurance IN (N'Unknown', N'Yes', N'No', N'In process'));
+IF COL_LENGTH(N'dbo.Vendors', N'EmailStatus') IS NULL
+    ALTER TABLE dbo.Vendors ADD EmailStatus NVARCHAR(1000) NULL, EmailCheckedAt DATETIME2(0) NULL;
 """
+
+ONBOARDED_VALUES = ["No", "In process", "Yes"]
+LIABILITY_VALUES = ["Unknown", "Yes", "No", "In process"]
+# Columns that can't be blank: clearing one in the viewer resets it to its default
+COLUMN_DEFAULTS = {"Onboarded": "No", "LiabilityInsurance": "Unknown"}
 
 
 class DbError(Exception):
@@ -232,6 +250,8 @@ def records_from_sheet(df: pd.DataFrame, mapping: dict[str, str], vendor_col: st
             InsuranceOrBond=row.get(mapping[enrich.OUT_INSURANCE]),
             ScrapeStatus=row.get(mapping[enrich.OUT_STATUS]),
             State=row.get(state_col) if state_col else None,
+            VendorType=enrich.vendor_type(row.get(mapping.get(enrich.OUT_TYPE, ""))) or enrich.vendor_type(
+                row.get(vendor_col)),
             Source=SOURCE_SHEET, SourceFile=source_file,
             ExtraData=json.dumps(extra, ensure_ascii=False) if extra else None,
         )
@@ -249,6 +269,7 @@ def records_from_urls(rows: list[dict]) -> list[dict]:
             ContactName=row.get("Contact Names"), Email=row.get("Emails"), Phone=row.get("Phone Numbers"),
             InsuranceOrBond=row.get("Insurance or Bond"), ScrapeStatus=row.get("Status"),
             PagesScraped=row.get("Pages Scraped"), Source=SOURCE_URLS,
+            VendorType=enrich.vendor_type(row.get("Vendor Type")),
         )
         if rec:
             out.append(rec)
@@ -282,6 +303,8 @@ def _merge_sql() -> str:
            "ELSE COALESCE(t.VendorName, s.VendorName) END",
            "t.State = CASE WHEN t.LastEdited IS NULL THEN COALESCE(s.State, t.State) "
            "ELSE COALESCE(t.State, s.State) END",
+           "t.VendorType = CASE WHEN t.LastEdited IS NULL THEN COALESCE(s.VendorType, t.VendorType) "
+           "ELSE COALESCE(t.VendorType, s.VendorType) END",
            "t.ScrapeStatus = s.ScrapeStatus",
            "t.SourceFile = COALESCE(s.SourceFile, t.SourceFile)",
            "t.ExtraData = COALESCE(s.ExtraData, t.ExtraData)",
@@ -301,7 +324,8 @@ OUTPUT $action;
 
 STAGE_SQL = """
 CREATE TABLE #stage (
-    RecordKey NVARCHAR(450) NOT NULL PRIMARY KEY, VendorName NVARCHAR(400), State NVARCHAR(100),
+    RecordKey NVARCHAR(450) NOT NULL PRIMARY KEY, VendorName NVARCHAR(400), VendorType NVARCHAR(50),
+    State NVARCHAR(100),
     Website NVARCHAR(1000),
     WebsiteDomain NVARCHAR(255), WebsiteSource NVARCHAR(100), ContactName NVARCHAR(1000),
     Email NVARCHAR(1000), Phone NVARCHAR(500), InsuranceOrBond NVARCHAR(MAX), ScrapeStatus NVARCHAR(500),
@@ -356,9 +380,10 @@ def save_records(cfg: DbConfig, records: list[dict]) -> dict[str, int]:
 SOURCE_MANUAL = "Manual"
 
 # Columns the viewer lets people change
-EDITABLE_COLUMNS = ["VendorName", "State", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes"]
-VIEW_COLUMNS = ["Id", *EDITABLE_COLUMNS, "WebsiteSource", "ScrapeStatus", "Source", "SourceFile", "ExtraData",
-                "FirstSeen", "LastScraped", "LastEdited", "LastEditedBy"]
+EDITABLE_COLUMNS = ["VendorName", "VendorType", "State", "Onboarded", "LiabilityInsurance", "Website",
+                    "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes"]
+VIEW_COLUMNS = ["Id", *EDITABLE_COLUMNS, "EmailStatus", "EmailCheckedAt", "WebsiteSource", "ScrapeStatus",
+                "Source", "SourceFile", "ExtraData", "FirstSeen", "LastScraped", "LastEdited", "LastEditedBy"]
 
 
 @dataclass
@@ -409,6 +434,7 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
         cur = conn.cursor()
         for row_id, changes in updates.items():
             sets = {c: _text(v) for c, v in changes.items() if c in EDITABLE_COLUMNS}
+            sets.update({c: sets[c] or d for c, d in COLUMN_DEFAULTS.items() if c in sets})
             if not sets:
                 continue
             if "Website" in sets:
@@ -432,7 +458,8 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
                 result.conflicts.append(f"{names.get(row_id) or f'record {row_id}'} (not deleted)")
 
         for row in inserts:
-            fields = {c: row.get(c) for c in EDITABLE_COLUMNS if c not in ("VendorName", "Website", "Notes")}
+            fields = {c: row.get(c) for c in EDITABLE_COLUMNS
+                      if c not in ("VendorName", "Website", "Notes", *COLUMN_DEFAULTS)}
             rec = _record(row.get("VendorName"), row.get("Website"), Source=SOURCE_MANUAL, **fields)
             if rec is None:
                 continue  # blank row
@@ -446,6 +473,10 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
                 f"VALUES ({', '.join('?' * (len(FIELDS) + 1))}, SYSUTCDATETIME(), COALESCE(?, SUSER_SNAME()))",
                 [*(rec[f] for f in FIELDS), _text(row.get("Notes")), editor],
             )
+            statuses = {c: _text(row.get(c)) for c in COLUMN_DEFAULTS if _text(row.get(c))}
+            if statuses:
+                cur.execute(f"UPDATE dbo.Vendors SET {', '.join(f'{c} = ?' for c in statuses)} WHERE RecordKey = ?",
+                            [*statuses.values(), rec["RecordKey"]])
             result.inserted += 1
         conn.commit()
     except DbError:
@@ -456,3 +487,65 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
     finally:
         conn.close()
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Rescans and email checks on selected records
+# --------------------------------------------------------------------------- #
+
+RESCAN_COLUMNS = ["Id", "VendorName", "VendorType", "State", "Website", "WebsiteDomain", "WebsiteSource",
+                  "ContactName", "Email", "Phone", "InsuranceOrBond", "ScrapeStatus", "PagesScraped", "ExtraData"]
+
+
+def load_records(cfg: DbConfig, ids: list[int]) -> list[dict]:
+    """Full records for the given Ids, each with its RowVer, for rescanning."""
+    if not ids:
+        return []
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT {', '.join(RESCAN_COLUMNS)}, RowVer FROM dbo.Vendors "
+                    f"WHERE Id IN ({', '.join('?' * len(ids))})", [int(i) for i in ids])
+        return [{**dict(zip(RESCAN_COLUMNS, r[:-1])), "RowVer": bytes(r[-1])} for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        raise DbError(_friendly(exc)) from exc
+    finally:
+        conn.close()
+
+
+def update_scanned(cfg: DbConfig, updates: list[tuple[int, bytes, dict]]) -> tuple[int, int]:
+    """Write rescan results [(Id, RowVer, {column: value})]; returns (updated, skipped-as-changed)."""
+    done = skipped = 0
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        for row_id, rowver, fields in updates:
+            if not fields:
+                continue
+            cur.execute(f"UPDATE dbo.Vendors SET {', '.join(f'{c} = ?' for c in fields)}, "
+                        "LastScraped = SYSUTCDATETIME() WHERE Id = ? AND RowVer = ?",
+                        [*fields.values(), row_id, rowver])
+            done, skipped = (done + 1, skipped) if cur.rowcount == 1 else (done, skipped + 1)
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        raise DbError(_friendly(exc)) from exc
+    finally:
+        conn.close()
+    return done, skipped
+
+
+def save_email_statuses(cfg: DbConfig, statuses: dict[int, str | None]) -> int:
+    """Store email-check results; they don't touch scraped data, so no version check is needed."""
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.executemany("UPDATE dbo.Vendors SET EmailStatus = ?, EmailCheckedAt = SYSUTCDATETIME() WHERE Id = ?",
+                        [[s, int(i)] for i, s in statuses.items()])
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        raise DbError(_friendly(exc)) from exc
+    finally:
+        conn.close()
+    return len(statuses)

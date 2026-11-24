@@ -45,7 +45,30 @@ OUT_EMAIL = "Email"
 OUT_PHONE = "Phone"
 OUT_INSURANCE = "Insurance or Bond"
 OUT_STATUS = "Scrape Status"
+OUT_TYPE = "Vendor Type"
 DATA_FIELDS = [OUT_NAME, OUT_EMAIL, OUT_PHONE, OUT_INSURANCE]
+
+# Vendor types the app knows, and the words that identify each
+VENDOR_TYPES = ["Roofers", "Gutters", "Plumbers"]
+_TYPE_PATTERNS = {
+    "Roofers": re.compile(r"\broof", re.I),  # word start, so "waterproofing" doesn't count
+    "Gutters": re.compile(r"gutter", re.I),
+    "Plumbers": re.compile(r"plumb|rooter|drain|sewer|septic|water heater", re.I),
+}
+
+
+def vendor_type(value) -> str | None:
+    """Normalize a trade/type label ("Roofing", "Gutter", "plumber") to a known vendor type."""
+    text = str(value or "")
+    hits = [(m.start(), t) for t, p in _TYPE_PATTERNS.items() if (m := p.search(text))]
+    return min(hits)[1] if hits else None  # "Roofing & Gutters" -> Roofers: first-named trade
+
+
+def guess_vendor_type(text: str, min_mentions: int = 3) -> str | None:
+    """Most-mentioned trade in a page's text, if it's mentioned enough to be meaningful."""
+    counts = {t: len(p.findall(text or "")) for t, p in _TYPE_PATTERNS.items()}
+    best = max(counts, key=counts.get)
+    return best if counts[best] >= min_mentions else None
 
 # Values this app writes for gaps: treated as blank when a sheet is re-run
 PLACEHOLDERS = {NOT_FOUND, NO_WEBSITE, SITE_UNREACHABLE, SEARCH_FAILED, INSURANCE_UNKNOWN}
@@ -463,7 +486,7 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
     if given in PLACEHOLDERS:
         given = ""
     location = " ".join(str(row.get(c, "")).strip() for c in cfg.location_cols).strip()
-    out: dict[str, str] = {}
+    out: dict[str, str] = {OUT_TYPE: vendor_type(vendor) or ""}
 
     url = normalize_url(given) if given else None
     if url:
@@ -503,6 +526,7 @@ def enrich_row(row: dict, cfg: EnrichConfig, search: WebSearch) -> dict:
         source = SRC_FOUND if source == SRC_PHONE_MATCH else source
         out[OUT_SOURCE] = source
 
+    out[OUT_TYPE] = out[OUT_TYPE] or guess_vendor_type(result.text) or ""
     out[OUT_NAME] = ", ".join(sorted(clean_names(sorted(result.names), vendor))) or NOT_FOUND
     out[OUT_EMAIL] = ", ".join(sorted(result.emails)) or NOT_FOUND
     out[OUT_PHONE] = ", ".join(sorted(result.phones)) or NOT_FOUND
@@ -579,6 +603,8 @@ def _match_output_col(field: str, norm: str) -> bool:
         return norm == "websitesource"
     if field == OUT_STATUS:
         return norm == "scrapestatus"
+    if field == OUT_TYPE:
+        return norm in ("vendortype", "type", "trade", "category", "servicetype", "service", "industry")
     return False
 
 
@@ -622,7 +648,7 @@ def output_columns(df: pd.DataFrame, cfg: EnrichConfig) -> dict[str, str]:
     """Map each output field to the sheet column it goes in (existing column when one fits)."""
     taken = {cfg.vendor_col, *cfg.location_cols}
     mapping: dict[str, str] = {}
-    for field in [OUT_WEBSITE, OUT_SOURCE, OUT_STATUS, OUT_EMAIL, OUT_PHONE, OUT_INSURANCE, OUT_NAME]:
+    for field in [OUT_WEBSITE, OUT_SOURCE, OUT_STATUS, OUT_TYPE, OUT_EMAIL, OUT_PHONE, OUT_INSURANCE, OUT_NAME]:
         if field == OUT_WEBSITE and cfg.website_col:
             mapping[field] = cfg.website_col
             taken.add(cfg.website_col)
@@ -648,7 +674,7 @@ def merge_row(row: dict, out: dict, mapping: dict[str, str]) -> dict:
 
 def ordered_columns(df: pd.DataFrame, mapping: dict[str, str]) -> list[str]:
     cols = list(df.columns)
-    order = [OUT_WEBSITE, OUT_SOURCE, OUT_NAME, OUT_EMAIL, OUT_PHONE, OUT_INSURANCE, OUT_STATUS]
+    order = [OUT_TYPE, OUT_WEBSITE, OUT_SOURCE, OUT_NAME, OUT_EMAIL, OUT_PHONE, OUT_INSURANCE, OUT_STATUS]
     return cols + [mapping[f] for f in order if mapping[f] not in cols]
 
 

@@ -16,7 +16,8 @@ import db
 import enrich
 from scraper import INSURANCE_UNKNOWN, ScrapeResult, scrape_url
 
-URL_COLUMNS = ["URL", "Status", "Emails", "Phone Numbers", "Contact Names", "Insurance or Bond", "Pages Scraped"]
+URL_COLUMNS = ["URL", "Status", "Vendor Type", "Emails", "Phone Numbers", "Contact Names", "Insurance or Bond",
+               "Pages Scraped"]
 
 
 # --------------------------------------------------------------------------- #
@@ -363,7 +364,8 @@ with tab_urls:
     if start:
         def url_task(i: int) -> dict:
             try:
-                return scrape_url(urls[i]).as_row()
+                result = scrape_url(urls[i])
+                return {**result.as_row(), "Vendor Type": enrich.guess_vendor_type(result.text) or ""}
             except Exception as exc:  # noqa: BLE001 - scrape_url shouldn't raise
                 return ScrapeResult(url=urls[i], status=f"Error: {type(exc).__name__}").as_row()
 

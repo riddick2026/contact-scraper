@@ -6,6 +6,8 @@ pandas>=2.1
 openpyxl>=3.1
 xlrd>=2.0
 ddgs>=9.5
+# DNS lookups for the email check (does the domain exist and accept mail?)
+dnspython>=2.6
 # Azure SQL storage (Microsoft's driver; no separate ODBC install needed)
 mssql-python>=1.0
 azure-identity>=1.19

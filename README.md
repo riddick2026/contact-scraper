@@ -68,11 +68,27 @@ The app signs in with your Microsoft Entra ID account through the Azure CLI, so 
 
 Open **🗂️ Database viewer** in the app's sidebar to browse and update the saved records in a spreadsheet-style grid:
 
-- **Search** across vendor, website, contact, email, phone, insurance and notes; **Show** quick filters (missing email/phone/contact/insurance, website needs checking, edited by hand); **Added from** filters by spreadsheet, URL list or manual.
-- **Edit** a cell by clicking it (press Enter to open it, Enter again to keep the change). Vendor, state, website, contact name, email, phone, insurance and notes are editable; dates and scrape details are read-only.
+- **Search** across vendor, type, website, contact, email, phone, insurance and notes.
+- **Show** quick filters: no email, valid phone number, no valid phone number, missing contact name or insurance, email problems, emails not checked yet, website needs checking, edited by hand.
+- **Filter** by Added from (spreadsheet, URL list, manual), **Vendor type**, **Onboarded** and **Liability insurance**.
+- **Sort by** any column, ascending or descending, on top of any filter. The default is last activity, newest first.
+- **Edit** a cell by clicking it (press Enter to open it, Enter again to keep the change). Vendor, vendor type, state, onboarded, liability insurance, website, contact name, email, phone, insurance or bond, and notes are editable; dates and scrape details are read-only.
+- **Select** records with the ✔ column (or **Select all shown**), then:
+  - **🔄 Rescan selected** looks for missing contact name, email, phone, insurance and vendor type on each vendor's website, and searches for a website when there isn't one (using the same checks as spreadsheet mode). It only fills empty or "Not found" fields; it never changes existing values, including hand edits.
+  - **✉️ Check emails** checks each address for a bad format, a typo in a common domain (gmial.com), placeholder or system addresses, throwaway inboxes, and domains that don't exist or can't receive mail. Results go in **Email check**. These free checks can't confirm that a specific mailbox exists at a working domain; only sending a message (or a paid verification service) can.
 - **Add** a record in the empty last row. **Delete** by selecting rows by their left edge and pressing Delete; you confirm before anything is removed.
 - Nothing is written until **Save changes**. Each change records who made it and when. If a record was re-scraped or edited elsewhere after you loaded it, your change to that record is skipped and reported instead of overwriting newer data.
 - **Download this view** exports the filtered records to Excel.
+
+### Vendor fields
+
+| Field | Values | Notes |
+|---|---|---|
+| Vendor type | Roofers, Gutters, Plumbers | From a spreadsheet column named Trade, Type, Category or Vendor Type; otherwise from the vendor's name, then their website. |
+| Onboarded | No, In process, Yes | New vendors start at No. |
+| Liability insurance | Unknown, Yes, No, In process | New vendors start at Unknown. |
+
+The database only accepts the listed values for Onboarded and Liability insurance. Clearing one in the viewer resets it to its default.
 
 ### Set up a computer
 
@@ -145,7 +161,9 @@ Install spaCy and its English model; the scraper uses it automatically when pres
 
 - `app.py`: entry point and page navigation
 - `scraper_page.py`: scraper UI (spreadsheet + URL modes, progress, results, exports, save to Azure SQL)
-- `viewer_page.py`: Database viewer (browse, filter, edit, add, delete, export)
+- `viewer_page.py`: Database viewer (browse, filter, sort, edit, add, delete, rescan, email check, export)
+- `rescan.py`: rescans selected records and fills only their missing fields
+- `checks.py`: phone number validity and email deliverability checks
 - `enrich.py`: spreadsheet loading (CSV/Excel/Google Sheets), website search, row enrichment, colour-coded Excel export
 - `db.py`: Azure SQL storage (connection, `dbo.Vendors` table, save/update logic, viewer reads and edits)
 - `scraper.py`: scraping engine (fetching, link following, email/phone/name extraction)
