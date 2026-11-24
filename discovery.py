@@ -640,65 +640,84 @@ def _check_candidate(url: str, trade: Trade, area: AreaFilter, place: str) -> Di
                       source=SOURCE_WEB)
 
 
-def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print) -> list[Discovered]:
-    """Search several phrasings of '[trade] [city], [state]' for each place in the area; keep verified business sites.
+WEB_TIME_BUDGET = 600  # seconds of web searching per trade before Stage 1 moves on
 
-    Site checks run in the background while the next place is searched, so a long city list
-    costs little more than the searches themselves. Stops once `limit` businesses are verified.
+
+def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print,
+                 time_budget: float = WEB_TIME_BUDGET) -> list[Discovered]:
+    """Find verified business sites for the trade by searching the area's towns, breadth-first.
+
+    Round 1 searches the main phrasing ("roofing contractor <town>, <state>") in every town, round 2
+    the next phrasing in every town, and so on. It stops when `limit` businesses are verified, when
+    a round turns up almost nothing new (the area is covered), or when `time_budget` runs out.
+    Site checks run in the background while searching continues.
     """
     from enrich import SearchError, _is_directory, _registered_domain
 
+    started = time.monotonic()
     seen_domains: set[str] = set()
     seen_phones: set[str] = set()
     found: list[Discovered] = []
     places = area.search_places or [STATES[area.state]]
     state_name = STATES[area.state]  # full name: engines misread "OK", "OR", "ID"
     phrasings = [trade.search, *trade.search_alt]
-    search.min_interval = max(search.min_interval, 1.5)  # many searches in a row: pace them to avoid rate limits
+    search.min_interval = max(search.min_interval, 1.5)  # per engine; queries rotate across engines
 
-    def harvest(pending: list, place_counts: dict, wait: bool) -> None:
+    def harvest(pending: list, wait: bool) -> None:
         """Collect finished site checks (all of them if wait=True), de-duplicating by phone number."""
-        for item in list(pending):
-            fut, place = item
+        for fut in list(pending):
             if not (wait or fut.done()):
                 continue
-            pending.remove(item)
+            pending.remove(fut)
             d = fut.result()
             key = re.sub(r"\D", "", d.phone or "")[-10:] if d else ""
             if d and not (key and key in seen_phones) and len(found) < limit:  # lead-gen networks reuse numbers
                 if key:
                     seen_phones.add(key)
                 found.append(d)
-                place_counts[place] = place_counts.get(place, 0) + 1
 
     pending: list = []
-    verified: dict[str, int] = {}
+    stop = ""
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for place in places:
-            harvest(pending, verified, wait=False)
-            if len(found) >= limit:
-                break
-            queries = [f"{phrasings[0]} {place}, {state_name}"] + [
-                f"{p} {place} {state_name} {NO_DIRECTORIES}" for p in phrasings[1:]]
-            results = []
-            for query in queries:
+        for rnd, phrase in enumerate(phrasings, start=1):
+            searched = new_candidates = 0
+            for place in places:
+                harvest(pending, wait=False)
+                if len(found) >= limit:
+                    stop = f"reached the limit of {limit}"
+                    break
+                if time.monotonic() - started > time_budget:
+                    stop = f"used its {time_budget // 60:.0f}-minute search budget"
+                    break
+                query = (f"{phrase} {place}, {state_name}" if rnd == 1
+                         else f"{phrase} {place} {state_name} {NO_DIRECTORIES}")
                 try:
-                    results += search.search(query, max_results=30, local=True)
+                    results = search.search(query, max_results=30, local=True)
                 except SearchError as exc:
-                    log(f"Stage 1: web search failed for '{query}' ({exc})")
-            new_urls = 0
-            for r in results:
-                url = r.get("url", "")
-                dom = _registered_domain(urlparse(url).hostname or "")
-                if not url.startswith("http") or not dom or dom in seen_domains or _is_directory(url, r.get("title", "")):
+                    log(f"Stage 1: search skipped for '{query}' ({str(exc)[:80]})")
                     continue
-                seen_domains.add(dom)
-                pending.append((pool.submit(_check_candidate, url, trade, area, place), place))
-                new_urls += 1
-            log(f"Stage 1: {trade.label} in {place}: {len(results)} search results, {new_urls} new candidate sites "
-                f"({len(found)} verified so far)")
-        harvest(pending, verified, wait=True)
-    log(f"Stage 1: {trade.label} web search: {len(found)} verified businesses across {len(places)} places")
+                searched += 1
+                for r in results:
+                    url = r.get("url", "")
+                    dom = _registered_domain(urlparse(url).hostname or "")
+                    if not url.startswith("http") or not dom or dom in seen_domains \
+                            or _is_directory(url, r.get("title", "")):
+                        continue
+                    seen_domains.add(dom)
+                    pending.append(pool.submit(_check_candidate, url, trade, area, place))
+                    new_candidates += 1
+            harvest(pending, wait=True)
+            log(f"Stage 1: {trade.label} web search round {rnd} ('{phrase}'): {searched} towns searched, "
+                f"{new_candidates} new candidate sites; {len(found)} verified businesses so far "
+                f"({time.monotonic() - started:.0f}s)")
+            if stop:
+                break
+            if rnd > 1 and new_candidates < max(3, 0.05 * len(seen_domains)):
+                stop = "found almost nothing new in the last round (area covered)"
+                break
+    log(f"Stage 1: {trade.label} web search finished: {len(found)} verified businesses in "
+        f"{time.monotonic() - started:.0f}s" + (f"; stopped because it {stop}" if stop.startswith(("reached", "used"))
+                                                 else f" ({stop})" if stop else ""))
     return found[:limit]
 
 

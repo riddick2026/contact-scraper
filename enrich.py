@@ -370,7 +370,7 @@ def _bing_html(query: str) -> list[dict]:
     return out
 
 
-def _ddgs_lib(query: str, max_results: int = 10) -> list[dict]:
+def _ddgs_lib(query: str, max_results: int = 10, backend: str = "auto") -> list[dict]:
     try:
         from ddgs import DDGS
     except ImportError:
@@ -378,7 +378,7 @@ def _ddgs_lib(query: str, max_results: int = 10) -> list[dict]:
             from duckduckgo_search import DDGS  # type: ignore  # older package name
         except ImportError as exc:
             raise SearchError("ddgs package not installed") from exc
-    results = DDGS().text(query, max_results=max_results, region="us-en")
+    results = DDGS(timeout=4).text(query, max_results=max_results, region="us-en", backend=backend)
     return [{"url": r.get("href", ""), "title": r.get("title", "")} for r in results or []]
 
 
@@ -398,17 +398,21 @@ class WebSearch:
         self._last = 0.0
         self.failures: dict[str, int] = {}
         self.rest_until: dict[str, float] = {}
+        self._last_call: dict[str, float] = {}
         self._last_result: dict[str, tuple[str, tuple]] = {}
         self.last_engine = ""
-        self.engines = ([("Brave", self._brave)] if self.brave_key else []) + [
-            ("ddgs", _ddgs_lib), ("DuckDuckGo", _ddg_html), ("Bing", _bing_html)]
+        # Engines are rotated so many searches in a row don't all land on (and get throttled by) one
+        self.engines = [("Yahoo", "yahoo"), ("Google", "google"), ("DuckDuckGo", "duckduckgo"),
+                        ("DuckDuckGo HTML", _ddg_html), ("Bing", _bing_html)]
+        self._turn = 0
 
-    def _wait_turn(self) -> None:
+    def _wait_turn(self, engine: str = "") -> None:
+        """Space calls to the same engine min_interval apart (different engines can run back to back)."""
         with self._lock:
-            delay = self._last + self.min_interval - time.monotonic()
+            delay = self._last_call.get(engine, 0.0) + self.min_interval - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
-            self._last = time.monotonic()
+            self._last_call[engine] = time.monotonic()
 
     def _brave(self, query: str) -> list[dict]:
         resp = requests.get(
@@ -429,21 +433,32 @@ class WebSearch:
     def _ddg(self, query: str) -> list[dict]:
         return _ddgs_lib(query)
 
-    def search(self, query: str, max_results: int = 10, local: bool = False) -> list[dict]:
-        """Results for the query. local=True skips Bing's HTML page, which ignores the place in the query."""
-        engines = [(n, e) for n, e in self.engines if not (local and n == "Bing")]
+    def search(self, query: str, max_results: int = 10, local: bool = False, max_wait: float = 30) -> list[dict]:
+        """Results for the query, from the next engine in rotation (falling back to the others).
+
+        local=True skips Bing's HTML page, which ignores the place in the query. If every engine
+        is resting after rate limits, waits at most max_wait seconds for one before giving up.
+        """
+        pool = [(n, e) for n, e in self.engines if not (local and n == "Bing")]
+        with self._lock:
+            self._turn += 1
+            # Rotate among engines that are currently working; ones that failed recently go last
+            healthy = [x for x in pool if not self.failures.get(x[0])]
+            k = self._turn % len(healthy) if healthy else 0
+            engines = (([("Brave", self._brave)] if self.brave_key else []) + healthy[k:] + healthy[:k]
+                       + sorted((x for x in pool if x not in healthy), key=lambda x: self.failures.get(x[0], 0)))
         errors = []
         for attempt in range(3):
             # If every engine is resting, wait for the first to be ready rather than giving up
             waits = [self.rest_until.get(n, 0) - time.monotonic() for n, _ in engines]
             if waits and min(waits) > 0:
-                time.sleep(min(min(waits), 120))
+                time.sleep(min(min(waits), max_wait))
             for name, engine in engines:
                 if time.monotonic() < self.rest_until.get(name, 0):
                     continue  # resting after failures (likely rate-limited); tried again later
-                self._wait_turn()
+                self._wait_turn(name)
                 try:
-                    results = (_ddgs_lib(query, max_results) if name == "ddgs" else engine(query))
+                    results = (_ddgs_lib(query, max_results, engine) if isinstance(engine, str) else engine(query))
                     urls = tuple(r.get("url", "") for r in results)
                     prev_query, prev_urls = self._last_result.get(name, ("", ()))
                     if urls and urls == prev_urls and query != prev_query:
