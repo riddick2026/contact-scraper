@@ -11,8 +11,10 @@ import streamlit as st
 
 import checks
 import db
+import discovery
 import enrich
-import rescan
+import pipeline
+import routing
 
 GAPS = set(db.GAP_VALUES) | {""}
 
@@ -36,6 +38,9 @@ DEFAULT_SORT = "Last activity"
 COLUMN_CONFIG = {
     "Select": st.column_config.CheckboxColumn("✔", width="small", help="Select records to rescan or check"),
     "Id": st.column_config.NumberColumn("ID", width="small", format="%d"),
+    "Queue": st.column_config.TextColumn("Queue", width="small"),
+    "MissingFields": st.column_config.TextColumn("Missing", width="medium",
+                                                 help="Critical fields the deep dive couldn't find"),
     "VendorName": st.column_config.TextColumn("Vendor", width="medium"),
     "VendorType": st.column_config.SelectboxColumn("Vendor type", options=enrich.VENDOR_TYPES, width="small"),
     "State": st.column_config.TextColumn("State", width="small"),
@@ -51,6 +56,19 @@ COLUMN_CONFIG = {
     "Notes": st.column_config.TextColumn("Notes", width="large"),
     "EmailStatus": st.column_config.TextColumn("Email check", width="medium"),
     "EmailCheckedAt": st.column_config.DatetimeColumn("Email checked (UTC)", format="YYYY-MM-DD HH:mm"),
+    "Address": st.column_config.TextColumn("Address", width="medium"),
+    "City": st.column_config.TextColumn("City", width="small"),
+    "Zip": st.column_config.TextColumn("ZIP", width="small"),
+    "Region": st.column_config.TextColumn("Region", width="small"),
+    "ServiceArea": st.column_config.TextColumn("Service area", width="medium"),
+    "CompletionScore": st.column_config.ProgressColumn("Completeness", min_value=0, max_value=100, format="%d%%",
+                                                       width="small"),
+    "LicenseNumber": st.column_config.TextColumn("WA license #"),
+    "UBI": st.column_config.TextColumn("UBI"),
+    "EnrichmentStatus": st.column_config.TextColumn("Deep dive"),
+    "EnrichedAt": st.column_config.DatetimeColumn("Deep-dived (UTC)", format="YYYY-MM-DD HH:mm"),
+    "QueueLocked": st.column_config.CheckboxColumn("Moved by hand", width="small"),
+    "ScanRunId": st.column_config.NumberColumn("Scan #", format="%d", width="small"),
     "WebsiteSource": st.column_config.TextColumn("Website source"),
     "ScrapeStatus": st.column_config.TextColumn("Scrape status"),
     "Source": st.column_config.TextColumn("Added from", width="small"),
@@ -128,26 +146,27 @@ def sort_view(df: pd.DataFrame, label: str, descending: bool) -> pd.DataFrame:
 
 
 def run_rescan(ids: list[int]) -> None:
-    """Rescan the records, write what was found, and leave a summary message for the next run."""
+    """Deep-dive the records again, save what was found and re-route them; leave a summary message."""
     progress = st.progress(0.0, text="Loading records…")
     records = db.load_records(cfg, ids)
     search = enrich.WebSearch()
+    critical = db.critical_fields(cfg)
     results: list[tuple[dict, dict, str]] = []
     with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(rescan.rescan_record, r, search): r for r in records}
+        futures = {pool.submit(pipeline.deep_dive, r, search, critical, 6): r for r in records}
         for n, fut in enumerate(futures, start=1):
             rec = futures[fut]
             try:
                 fields, note = fut.result()
+                db.save_enrichment(cfg, rec["Id"], fields)
             except Exception as exc:  # noqa: BLE001 - one bad record shouldn't stop the batch
                 fields, note = {}, f"error: {type(exc).__name__}"
             results.append((rec, fields, note))
             progress.progress(n / len(records), text=f"Rescanned {n} / {len(records)}: {rec['VendorName']}")
-    updated, skipped = db.update_scanned(cfg, [(r["Id"], r["RowVer"], f) for r, f, _ in results])
-    lines = [f"- **{r['VendorName'] or r['Website']}**: {note}" for r, _, note in results]
-    filled = sum(note.startswith("filled") for _, _, note in results)
-    summary = (f"🔄 Rescanned {len(results)} record(s): {filled} with new information"
-               + (f"; {skipped} skipped because they changed during the scan" if skipped else "") + ".\n\n"
+    lines = [f"- **{r['VendorName'] or r['Website']}**: {note} → {f.get('Queue', r.get('Queue'))}"
+             for r, f, note in results]
+    filled = sum("filled" in note or "website found" in note for _, _, note in results)
+    summary = (f"🔄 Rescanned {len(results)} record(s): {filled} with new information.\n\n"
                + "\n".join(lines[:50]) + (f"\n- … and {len(lines) - 50} more" if len(lines) > 50 else ""))
     st.session_state.viewer_message = ("success" if filled else "info", summary)
 
@@ -159,6 +178,7 @@ def run_email_check(ids: list[int]) -> None:
             statuses = dict(zip(rows["Id"].astype(int),
                                 pool.map(lambda e: checks.check_emails(e) or "No email address", rows["Email"])))
         db.save_email_statuses(cfg, statuses)
+        db.reroute(cfg, list(statuses))
     problems = {i: s for i, s in statuses.items() if not checks.email_status_is_ok(s) and s != "No email address"}
     names = dict(zip(rows["Id"].astype(int), rows["VendorName"]))
     detail = "\n".join(f"- **{names[i]}**: {s}" for i, s in list(problems.items())[:50])
@@ -170,14 +190,34 @@ def run_email_check(ids: list[int]) -> None:
           "mail. They can't confirm a specific mailbox exists.")
 
 
-def to_excel(df: pd.DataFrame) -> bytes:
+EXPORT_COLUMNS = {"VendorName": "Business_Name", "VendorType": "Trade", "ContactName": "Contact_Name",
+                  "Email": "Email", "EmailStatus": "Email_Check", "Phone": "Phone", "Website": "Website",
+                  "Address": "Address", "City": "City", "Zip": "ZIP", "State": "State", "Region": "Region",
+                  "ServiceArea": "Service_Area", "InsuranceOrBond": "Insurance_or_Bond",
+                  "LicenseNumber": "WA_License", "UBI": "UBI", "Onboarded": "Onboarded",
+                  "LiabilityInsurance": "Liability_Insurance", "CompletionScore": "Completeness_Pct",
+                  "EnrichedAt": "Enriched_At_UTC", "Notes": "Notes", "Id": "Record_ID"}
+
+
+def export_frame(df: pd.DataFrame, with_queue: bool) -> pd.DataFrame:
+    """Clean, CRM-friendly columns; the all-records export adds Queue_Status and Missing_Fields."""
+    out = df[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS)
+    if with_queue:
+        out.insert(0, "Queue_Status", df["Queue"].values)
+        out.insert(1, "Missing_Fields", df["MissingFields"].fillna("").values)
+    out["Enriched_At_UTC"] = pd.to_datetime(out["Enriched_At_UTC"]).dt.tz_localize(None)
+    return out
+
+
+def to_excel(df: pd.DataFrame, labelled: bool = True) -> bytes:
     out = df.copy()
     out = out.drop(columns=["Select"], errors="ignore")
-    for col in ("FirstSeen", "LastScraped", "LastEdited", "EmailCheckedAt"):
-        out[col] = pd.to_datetime(out[col]).dt.tz_localize(None)
+    for col in ("FirstSeen", "LastScraped", "LastEdited", "EmailCheckedAt", "EnrichedAt"):
+        if col in out:
+            out[col] = pd.to_datetime(out[col]).dt.tz_localize(None)
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        out.rename(columns={k: v.get("label", k) for k, v in COLUMN_CONFIG.items()}) \
+        (out.rename(columns={k: v.get("label", k) for k, v in COLUMN_CONFIG.items()}) if labelled else out) \
            .to_excel(writer, index=False, sheet_name="Vendors")
         sheet = writer.sheets["Vendors"]
         for idx, col in enumerate(out.columns, start=1):
@@ -229,12 +269,26 @@ if top[1].button("🔄 Reload", width="stretch", help="Fetch the latest data (di
     except db.DbError as exc:
         st.error(f"Couldn't load records: {exc}")
 
-m = st.columns(5)
+COLUMN_CONFIG["VendorType"] = st.column_config.SelectboxColumn(
+    "Vendor type", width="small",
+    options=sorted(set(enrich.VENDOR_TYPES) | {t.vendor_type for t in discovery.TRADES.values()}
+                   | set(df_all["VendorType"].dropna())))
+
+n_primary = int((df_all["Queue"] == routing.PRIMARY).sum())
+m = st.columns(6)
 m[0].metric("Records", len(df_all))
-m[1].metric("With email", int((~_is_gap(df_all["Email"])).sum()))
-m[2].metric("With valid phone", int(df_all["Phone"].map(checks.has_valid_phone).sum()))
-m[3].metric("With insurance/bond", int((~_is_gap(df_all["InsuranceOrBond"])).sum()))
-m[4].metric("Edited by hand", int(df_all["LastEdited"].notna().sum()))
+m[1].metric("Primary queue", n_primary)
+m[2].metric("Secondary queue", len(df_all) - n_primary)
+m[3].metric("With email", int((~_is_gap(df_all["Email"])).sum()))
+m[4].metric("With valid phone", int(df_all["Phone"].map(checks.has_valid_phone).sum()))
+m[5].metric("Edited by hand", int(df_all["LastEdited"].notna().sum()))
+
+QUEUE_VIEWS = {"All records": None, f"Primary ({n_primary})": routing.PRIMARY,
+               f"Secondary ({len(df_all) - n_primary})": routing.SECONDARY}
+queue_label = st.segmented_control("Queue", list(QUEUE_VIEWS), default="All records", label_visibility="collapsed")
+queue_view = QUEUE_VIEWS.get(queue_label or "All records")
+st.caption(f"Critical fields for the Primary queue: **{', '.join(db.critical_fields(cfg))}** (change them on the "
+           "Scan page). Records you promote or demote by hand stay where you put them.")
 
 SORTABLE = {DEFAULT_SORT: None, **{COLUMN_CONFIG[c]["label"]: c for c in db.VIEW_COLUMNS
                                     if c not in ("ExtraData", "PagesScraped")}}
@@ -244,31 +298,36 @@ search = f1.text_input("Search", placeholder="Vendor, email, phone, website, not
 show = f2.selectbox("Show", list(FILTERS))
 picked = multiselect_filter(f3, "Added from", df_all["Source"])
 
-g1, g2, g3 = st.columns(3)
-picked_types = multiselect_filter(g1, "Vendor type", df_all["VendorType"], enrich.VENDOR_TYPES)
-picked_onboarded = multiselect_filter(g2, "Onboarded", df_all["Onboarded"], db.ONBOARDED_VALUES)
-picked_liability = multiselect_filter(g3, "Liability insurance", df_all["LiabilityInsurance"], db.LIABILITY_VALUES)
+g1, g2, g3, g4 = st.columns(4)
+picked_types = multiselect_filter(g1, "Vendor type", df_all["VendorType"],
+                                  list(dict.fromkeys([*enrich.VENDOR_TYPES,
+                                                      *(t.vendor_type for t in discovery.TRADES.values())])))
+picked_regions = multiselect_filter(g2, "Region", df_all["Region"])
+picked_onboarded = multiselect_filter(g3, "Onboarded", df_all["Onboarded"], db.ONBOARDED_VALUES)
+picked_liability = multiselect_filter(g4, "Liability insurance", df_all["LiabilityInsurance"], db.LIABILITY_VALUES)
 
 s1, s2, s3 = st.columns([2, 1, 1.6], vertical_alignment="bottom")
 sort_label = s1.selectbox("Sort by", list(SORTABLE))
 descending = s2.toggle("Descending", value=sort_label == DEFAULT_SORT)
-select_all = s3.checkbox("Select all shown", help="Tick every record in the current view (for rescan or email check)")
+select_all = s3.checkbox("Select all shown", help="Tick every record in the current view (for rescan, email check or queue moves)")
 
-view = FILTERS[show](df_all)
+view = FILTERS[show](df_all if queue_view is None else df_all[df_all["Queue"] == queue_view])
 view = view[in_choices(view["Source"], picked) & in_choices(view["VendorType"], picked_types)
+            & in_choices(view["Region"], picked_regions)
             & in_choices(view["Onboarded"], picked_onboarded) & in_choices(view["LiabilityInsurance"], picked_liability)]
 if search.strip():
     text = view[["VendorName", "VendorType", "State", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond",
-                 "Notes", "ExtraData"]].fillna("").astype(str).agg(" ".join, axis=1)
+                 "Notes", "ExtraData", "Address", "City", "Zip", "ServiceArea", "MissingFields", "LicenseNumber"]].fillna("").astype(str).agg(" ".join, axis=1)
     view = view[text.str.contains(search.strip(), case=False, regex=False)]
 view = sort_view(view, sort_label, descending).reset_index(drop=True)
 view.insert(0, "Select", select_all)
 
-st.caption("Click a cell to edit it. Tick ✔ to select records for **Rescan** or **Check emails**. Add a record in "
+st.caption("Click a cell to edit it. Tick ✔ to select records for **Rescan**, **Check emails** or queue moves. Add a record in "
            "the empty last row; select rows by their left edge and press Delete to remove them. Nothing is written "
            "until you click **Save changes**. Changing the search, filters or sort discards unsaved edits.")
 
-view_key = "|".join(map(str, (show, search, picked, picked_types, picked_onboarded, picked_liability,
+view_key = "|".join(map(str, (queue_view, show, search, picked, picked_types, picked_regions, picked_onboarded,
+                                picked_liability,
                                 sort_label, descending, select_all)))
 editor_key = f"editor-{st.session_state.viewer_token}-{hash(view_key)}"
 edited = st.data_editor(
@@ -344,8 +403,51 @@ if tools.button(f"✉️ Check emails ({len(selected)})", disabled=not selected 
         st.rerun()
     except db.DbError as exc:
         st.error(f"Couldn't check emails: {exc}")
+def move(queue: str | None) -> None:
+    try:
+        if queue is None:
+            counts = db.reroute(cfg, selected, unlock=True)
+            st.session_state.viewer_message = (
+                "success", f"↺ Handed {len(selected)} record(s) back to automatic routing: "
+                           f"{counts['Primary']} Primary, {counts['Secondary']} Secondary.")
+        else:
+            n = db.set_queue(cfg, selected, queue)
+            st.session_state.viewer_message = ("success", f"Moved {n} record(s) to the {queue} queue.")
+        load()
+        st.rerun()
+    except db.DbError as exc:
+        st.error(f"Couldn't move records: {exc}")
+
+
+if tools.button(f"⬆️ Promote to Primary ({len(selected)})", disabled=not selected or bool(pending),
+                help=busy_help or "Move to the Primary queue by hand; it stays there until you change it."):
+    move(routing.PRIMARY)
+if tools.button(f"⬇️ Demote to Secondary ({len(selected)})", disabled=not selected or bool(pending),
+                help=busy_help or "Move to the Secondary queue by hand; it stays there until you change it."):
+    move(routing.SECONDARY)
+if tools.button(f"↺ Auto-route ({len(selected)})", disabled=not selected or bool(pending),
+                help=busy_help or "Undo hand moves: put the records back in whichever queue their data qualifies for."):
+    move(None)
 if not selected:
-    tools.caption("Tick ✔ on records (or **Select all shown**) to rescan them or check their emails.")
+    tools.caption("Tick ✔ on records (or **Select all shown**) to rescan, check emails or move them between queues.")
+
+with st.expander("📤 Export queues"):
+    fmt = st.radio("Format", ["Excel (.xlsx)", "CSV"], horizontal=True, label_visibility="collapsed")
+    stamp = f"{datetime.now():%Y%m%d_%H%M}"
+    ex = st.container(horizontal=True)
+    for label, queue in (("Primary queue only", routing.PRIMARY), ("Secondary queue only", routing.SECONDARY),
+                         ("All records (with Queue_Status, Missing_Fields)", None)):
+        rows = df_all if queue is None else df_all[df_all["Queue"] == queue]
+        out = export_frame(rows, with_queue=queue is None)
+        slug = (queue or "all").lower()
+        ex.download_button(f"📥 {label} ({len(rows)})",
+                           data=to_excel(out, labelled=False) if fmt.startswith("Excel") else
+                           out.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"vendors_{slug}_{stamp}.{'xlsx' if fmt.startswith('Excel') else 'csv'}",
+                           mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                 if fmt.startswith("Excel") else "text/csv"),
+                           disabled=rows.empty, key=f"export-{slug}")
+    st.caption("Exports cover the whole queue, not just the filtered view (use **Download this view** for that).")
 
 if len(view) != len(df_all):
     st.caption(f"Showing {len(view)} of {len(df_all)} records.")

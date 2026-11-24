@@ -21,6 +21,6 @@ if is_test:
     )
 
 st.navigation([
-    st.Page("scraper_page.py", title="Scraper", icon="🔎", default=True),
+    st.Page("scan_page.py", title="Scan", icon="🛰️", default=True),
     st.Page("viewer_page.py", title="Database viewer", icon="🗂️"),
 ]).run()

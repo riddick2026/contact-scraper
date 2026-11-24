@@ -87,6 +87,42 @@ IF COL_LENGTH(N'dbo.Vendors', N'LiabilityInsurance') IS NULL
         CONSTRAINT CK_Vendors_LiabilityInsurance CHECK (LiabilityInsurance IN (N'Unknown', N'Yes', N'No', N'In process'));
 IF COL_LENGTH(N'dbo.Vendors', N'EmailStatus') IS NULL
     ALTER TABLE dbo.Vendors ADD EmailStatus NVARCHAR(1000) NULL, EmailCheckedAt DATETIME2(0) NULL;
+-- Discovery / deep-dive / queues
+IF COL_LENGTH(N'dbo.Vendors', N'Queue') IS NULL
+    ALTER TABLE dbo.Vendors ADD
+        Queue NVARCHAR(20) NOT NULL CONSTRAINT DF_Vendors_Queue DEFAULT N'Secondary'
+            CONSTRAINT CK_Vendors_Queue CHECK (Queue IN (N'Primary', N'Secondary')),
+        QueueLocked BIT NOT NULL CONSTRAINT DF_Vendors_QueueLocked DEFAULT 0,  -- moved by hand
+        MissingFields NVARCHAR(400) NULL,
+        CompletionScore INT NULL,
+        Address NVARCHAR(500) NULL,
+        City NVARCHAR(100) NULL,
+        Zip NVARCHAR(20) NULL,
+        Region NVARCHAR(100) NULL,
+        ServiceArea NVARCHAR(1000) NULL,
+        UBI NVARCHAR(20) NULL,                 -- WA state business ID
+        LicenseNumber NVARCHAR(50) NULL,       -- WA L&I contractor license
+        EnrichmentStatus NVARCHAR(20) NULL,    -- Pending / Done / Failed
+        EnrichedAt DATETIME2(0) NULL,
+        ScanRunId INT NULL;
+IF OBJECT_ID(N'dbo.ScanRuns', N'U') IS NULL
+    CREATE TABLE dbo.ScanRuns (
+        Id             INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_ScanRuns PRIMARY KEY,
+        StartedAt      DATETIME2(0)  NOT NULL CONSTRAINT DF_ScanRuns_StartedAt DEFAULT SYSUTCDATETIME(),
+        FinishedAt     DATETIME2(0)  NULL,
+        StartedBy      NVARCHAR(256) NULL,
+        Trades         NVARCHAR(500) NULL,
+        Areas          NVARCHAR(1000) NULL,
+        CriticalFields NVARCHAR(500) NULL,
+        Params         NVARCHAR(MAX) NULL,      -- full scan settings, JSON
+        Status         NVARCHAR(20)  NOT NULL,  -- Running / Completed / Interrupted / Cancelled / Failed
+        Discovered     INT NULL, NewRecords INT NULL, Enriched INT NULL,
+        PrimaryCount   INT NULL, SecondaryCount INT NULL,
+        Log            NVARCHAR(MAX) NULL
+    );
+IF OBJECT_ID(N'dbo.AppSettings', N'U') IS NULL
+    CREATE TABLE dbo.AppSettings (Name NVARCHAR(100) NOT NULL CONSTRAINT PK_AppSettings PRIMARY KEY,
+                                  Value NVARCHAR(MAX) NULL);
 """
 
 ONBOARDED_VALUES = ["No", "In process", "Yes"]
@@ -392,9 +428,12 @@ SOURCE_MANUAL = "Manual"
 
 # Columns the viewer lets people change
 EDITABLE_COLUMNS = ["VendorName", "VendorType", "State", "Onboarded", "LiabilityInsurance", "Website",
-                    "ContactName", "Email", "Phone", "InsuranceOrBond", "Notes"]
-VIEW_COLUMNS = ["Id", *EDITABLE_COLUMNS, "EmailStatus", "EmailCheckedAt", "WebsiteSource", "ScrapeStatus",
-                "Source", "SourceFile", "ExtraData", "FirstSeen", "LastScraped", "LastEdited", "LastEditedBy"]
+                    "ContactName", "Email", "Phone", "Address", "City", "Zip", "ServiceArea", "InsuranceOrBond",
+                    "Notes"]
+VIEW_COLUMNS = ["Id", "Queue", "MissingFields", *EDITABLE_COLUMNS, "CompletionScore", "Region", "EmailStatus",
+                "EmailCheckedAt", "WebsiteSource", "ScrapeStatus", "LicenseNumber", "UBI", "EnrichmentStatus",
+                "EnrichedAt", "Source", "SourceFile", "ExtraData", "FirstSeen", "LastScraped", "LastEdited",
+                "LastEditedBy", "QueueLocked", "ScanRunId"]
 
 
 @dataclass
@@ -497,6 +536,18 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
         raise DbError(_friendly(exc)) from exc
     finally:
         conn.close()
+    # Edits can complete (or break) a record: re-route edited and new rows (hand-moved ones stay put)
+    touched = list(updates)
+    if inserts:
+        conn = connect(cfg)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT Id FROM dbo.Vendors WHERE CompletionScore IS NULL")
+            touched += [int(r[0]) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    if touched:
+        reroute(cfg, touched)
     return result
 
 
@@ -505,7 +556,8 @@ def apply_changes(cfg: DbConfig, versions: dict[int, bytes], updates: dict[int, 
 # --------------------------------------------------------------------------- #
 
 RESCAN_COLUMNS = ["Id", "VendorName", "VendorType", "State", "Website", "WebsiteDomain", "WebsiteSource",
-                  "ContactName", "Email", "Phone", "InsuranceOrBond", "ScrapeStatus", "PagesScraped", "ExtraData"]
+                  "ContactName", "Email", "Phone", "InsuranceOrBond", "ScrapeStatus", "PagesScraped", "ExtraData",
+                  "Address", "City", "Zip", "ServiceArea", "EmailStatus", "QueueLocked", "Queue"]
 
 
 def load_records(cfg: DbConfig, ids: list[int]) -> list[dict]:
@@ -560,3 +612,287 @@ def save_email_statuses(cfg: DbConfig, statuses: dict[int, str | None]) -> int:
     finally:
         conn.close()
     return len(statuses)
+
+
+# --------------------------------------------------------------------------- #
+# App settings
+# --------------------------------------------------------------------------- #
+
+CRITICAL_SETTING = "critical_fields"
+
+
+def get_setting(cfg: DbConfig, name: str, default=None):
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT Value FROM dbo.AppSettings WHERE Name = ?", [name])
+        row = cur.fetchone()
+        return json.loads(row[0]) if row and row[0] else default
+    finally:
+        conn.close()
+
+
+def set_setting(cfg: DbConfig, name: str, value) -> None:
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("""MERGE dbo.AppSettings AS t USING (SELECT ? AS Name, ? AS Value) AS s ON t.Name = s.Name
+                       WHEN MATCHED THEN UPDATE SET Value = s.Value
+                       WHEN NOT MATCHED THEN INSERT (Name, Value) VALUES (s.Name, s.Value);""",
+                    [name, json.dumps(value)])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def critical_fields(cfg: DbConfig) -> list[str]:
+    import routing
+    saved = get_setting(cfg, CRITICAL_SETTING)
+    return [f for f in (saved or routing.DEFAULT_CRITICAL) if f in routing.CRITICAL_FIELDS]
+
+
+# --------------------------------------------------------------------------- #
+# Scan runs
+# --------------------------------------------------------------------------- #
+
+RUN_COLUMNS = ["Id", "StartedAt", "FinishedAt", "StartedBy", "Trades", "Areas", "CriticalFields", "Status",
+               "Discovered", "NewRecords", "Enriched", "PrimaryCount", "SecondaryCount", "Params"]
+
+
+def create_run(cfg: DbConfig, **fields) -> int:
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"INSERT INTO dbo.ScanRuns ({', '.join(fields)}) OUTPUT INSERTED.Id "
+                    f"VALUES ({', '.join('?' * len(fields))})", list(fields.values()))
+        run_id = int(cur.fetchone()[0])
+        conn.commit()
+        return run_id
+    finally:
+        conn.close()
+
+
+def update_run(cfg: DbConfig, run_id: int, log: str | None = None, **fields) -> None:
+    """Set run columns and/or append text to its log."""
+    sets = [f"{c} = ?" for c in fields] + (["Log = CONCAT(COALESCE(Log, N''), ?)"] if log else [])
+    if not sets:
+        return
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE dbo.ScanRuns SET {', '.join(sets)} WHERE Id = ?",
+                    [*fields.values(), *([log] if log else []), run_id])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_runs(cfg: DbConfig, limit: int = 20) -> pd.DataFrame:
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT TOP {int(limit)} {', '.join(RUN_COLUMNS)} FROM dbo.ScanRuns ORDER BY Id DESC")
+        return pd.DataFrame([list(r) for r in cur.fetchall()], columns=RUN_COLUMNS)
+    finally:
+        conn.close()
+
+
+def get_run_log(cfg: DbConfig, run_id: int) -> str:
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT Log FROM dbo.ScanRuns WHERE Id = ?", [run_id])
+        row = cur.fetchone()
+        return (row[0] or "") if row else ""
+    finally:
+        conn.close()
+
+
+def mark_interrupted(cfg: DbConfig, keep_ids: set[int]) -> int:
+    """Runs marked Running that no thread in this server is working on (e.g. after a restart)."""
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        ids = ", ".join(str(int(i)) for i in keep_ids) or "-1"
+        cur.execute(f"UPDATE dbo.ScanRuns SET Status = N'Interrupted', "
+                    f"Log = CONCAT(COALESCE(Log, N''), N'Interrupted (app restarted); resume to finish.' + CHAR(10)) "
+                    f"WHERE Status = N'Running' AND Id NOT IN ({ids})")
+        n = cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Discovery merge and deep-dive storage
+# --------------------------------------------------------------------------- #
+
+_SUFFIXES = re.compile(r"\b(llc|l l c|inc|incorporated|corp|corporation|co|company|ltd|pllc|lp|llp|dba)\b")
+
+
+def _name_key(name: str | None) -> str:
+    return re.sub(r"\s+", " ", _SUFFIXES.sub(" ", _vendor_key(name or ""))).strip()
+
+
+def _phone_keys(value) -> set[str]:
+    return {d[-10:] for d in (re.sub(r"\D", "", p) for p in re.split(r"[,;/]", str(value or ""))) if len(d) >= 10}
+
+
+def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None = None) -> tuple[int, int]:
+    """Add discovered businesses, merging with existing records (same UBI, name or phone).
+
+    Existing records only get empty fields filled; everything touched is queued for the deep dive
+    (EnrichmentStatus = 'Pending', ScanRunId = run). Returns (new records, matched existing).
+    `limit` caps how many *new* records are added.
+    """
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT Id, VendorName, Phone, UBI, VendorType, ContactName, Address, City, Zip, Region, "
+                    "State FROM dbo.Vendors")
+        cols = ["Id", "VendorName", "Phone", "UBI", "VendorType", "ContactName", "Address", "City", "Zip",
+                "Region", "State"]
+        existing = [dict(zip(cols, r)) for r in cur.fetchall()]
+        by_ubi = {e["UBI"]: e for e in existing if e["UBI"]}
+        by_name = {_name_key(e["VendorName"]): e for e in existing if e["VendorName"]}
+        by_phone = {p: e for e in existing for p in _phone_keys(e["Phone"])}
+
+        inserts, updates, seen = [], [], set()
+        for it in items:
+            match = (by_ubi.get(it.ubi) if it.ubi else None) or by_name.get(_name_key(it.name)) \
+                or next((by_phone[p] for p in _phone_keys(it.phone) if p in by_phone), None)
+            if match:
+                if match["Id"] in seen:
+                    continue
+                seen.add(match["Id"])
+                fill = {"UBI": it.ubi, "LicenseNumber": it.license_number, "Region": it.region}
+                for col, val in (("VendorType", it.vendor_type), ("ContactName", it.owner),
+                                 ("Address", it.address), ("City", it.city), ("Zip", it.zip),
+                                 ("State", "Washington")):
+                    if val and (match.get(col) is None or str(match.get(col)).strip() in GAP_VALUES + [""]):
+                        fill[col] = val
+                if it.phone and not _phone_keys(match["Phone"]):
+                    fill["Phone"] = it.phone
+                updates.append((match["Id"], {k: v for k, v in fill.items() if v}))
+            else:
+                if limit is not None and len(inserts) >= limit:
+                    continue
+                key = "vendor:" + _vendor_key(it.name)
+                inserts.append({
+                    "RecordKey": key[:450], "VendorName": it.name, "VendorType": it.vendor_type, "State": "Washington",
+                    "Phone": it.phone, "Address": it.address, "City": it.city, "Zip": it.zip, "Region": it.region,
+                    "ContactName": it.owner, "UBI": it.ubi, "LicenseNumber": it.license_number, "Source": it.source,
+                    "ScanRunId": run_id, "EnrichmentStatus": "Pending",
+                })
+                by_name[_name_key(it.name)] = {"Id": None}  # avoid duplicate inserts within this batch
+
+        for rec_id, fill in updates:
+            fill.update(ScanRunId=run_id, EnrichmentStatus="Pending")
+            cur.execute(f"UPDATE dbo.Vendors SET {', '.join(f'{c} = ?' for c in fill)} WHERE Id = ?",
+                        [*fill.values(), rec_id])
+        if inserts:
+            cols = list(inserts[0])
+            cur.executemany(
+                f"INSERT INTO dbo.Vendors ({', '.join(cols)}) SELECT {', '.join('?' * len(cols))} "
+                f"WHERE NOT EXISTS (SELECT 1 FROM dbo.Vendors WHERE RecordKey = ?)",
+                [[r[c] for c in cols] + [r["RecordKey"]] for r in inserts])
+        conn.commit()
+        return len(inserts), len(updates)
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        raise DbError(_friendly(exc)) from exc
+    finally:
+        conn.close()
+
+
+def pending_records(cfg: DbConfig, run_id: int) -> list[dict]:
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT {', '.join(RESCAN_COLUMNS)} FROM dbo.Vendors "
+                    "WHERE ScanRunId = ? AND EnrichmentStatus = N'Pending' ORDER BY Id", [run_id])
+        return [dict(zip(RESCAN_COLUMNS, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def save_enrichment(cfg: DbConfig, rec_id: int, fields: dict) -> None:
+    """Store one record's deep-dive results (gap fills, routing, status) as soon as it's done."""
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE dbo.Vendors SET {', '.join(f'{c} = ?' for c in fields)}, "
+                    "EnrichedAt = SYSUTCDATETIME(), LastScraped = SYSUTCDATETIME() WHERE Id = ?",
+                    [*fields.values(), rec_id])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def run_counts(cfg: DbConfig, run_id: int) -> dict[str, int]:
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT COUNT(*),
+                              SUM(CASE WHEN EnrichmentStatus IN (N'Done', N'Failed') THEN 1 ELSE 0 END),
+                              SUM(CASE WHEN Queue = N'Primary' THEN 1 ELSE 0 END),
+                              SUM(CASE WHEN Queue = N'Secondary' THEN 1 ELSE 0 END)
+                       FROM dbo.Vendors WHERE ScanRunId = ?""", [run_id])
+        total, done, prim, sec = (int(x or 0) for x in cur.fetchone())
+        return {"total": total, "done": done, "primary": prim, "secondary": sec}
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Queues
+# --------------------------------------------------------------------------- #
+
+def set_queue(cfg: DbConfig, ids: list[int], queue: str) -> int:
+    """Move records by hand (promote/demote); they stay put until auto-routing is turned back on."""
+    if not ids:
+        return 0
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE dbo.Vendors SET Queue = ?, QueueLocked = 1 WHERE Id IN ({', '.join('?' * len(ids))})",
+                    [queue, *[int(i) for i in ids]])
+        n = cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def reroute(cfg: DbConfig, ids: list[int] | None = None, critical: list[str] | None = None,
+            unlock: bool = False) -> dict[str, int]:
+    """Recompute Queue/MissingFields/CompletionScore for the given records (all if None).
+
+    unlock=True also clears hand moves first, handing the records back to automatic routing.
+    """
+    import routing
+    critical = critical or critical_fields(cfg)
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        where = f" WHERE Id IN ({', '.join(str(int(i)) for i in ids)})" if ids else ""
+        if ids is not None and not ids:
+            return {"Primary": 0, "Secondary": 0}
+        if unlock:
+            cur.execute(f"UPDATE dbo.Vendors SET QueueLocked = 0{where}")
+        cur.execute(f"SELECT {', '.join(RESCAN_COLUMNS)} FROM dbo.Vendors{where}")
+        rows = [dict(zip(RESCAN_COLUMNS, r)) for r in cur.fetchall()]
+        counts = {"Primary": 0, "Secondary": 0}
+        params = []
+        for r in rows:
+            f = routing.route(r, critical)
+            queue = f.get("Queue", r["Queue"])
+            counts[queue] += 1
+            params.append([queue, f["MissingFields"], f["CompletionScore"], r["Id"]])
+        cur.executemany("UPDATE dbo.Vendors SET Queue = ?, MissingFields = ?, CompletionScore = ? WHERE Id = ?",
+                        params)
+        conn.commit()
+        return counts
+    finally:
+        conn.close()

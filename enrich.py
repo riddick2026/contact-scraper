@@ -567,8 +567,10 @@ def site_matches_vendor(vendor: str, url: str, text: str, location: str = "") ->
     tokens = _name_tokens(vendor)
     distinct = [t for t in tokens if t not in GENERIC_WORDS and t not in PLACE_WORDS] or tokens
     flat = re.sub(r"[^a-z0-9]", "", low)
-    if not all(_token_in(t, root) or re.search(rf"\b{re.escape(t)}", low) or _token_in(t, flat[:20000])
-               for t in distinct):
+    hits = sum(bool(_token_in(t, root) or re.search(rf"\b{re.escape(t)}", low) or _token_in(t, flat[:20000]))
+               for t in distinct)
+    # Short names must match in full; longer ones may include abbreviations ("Cnst", "Svcs") a site never uses
+    if hits < (len(distinct) if len(distinct) < 3 else max(2, round(0.6 * len(distinct)))):
         return "reject", "site doesn't mention the vendor's name"
     trades = [stem for stem in TRADE_STEMS if stem in vendor.lower()]
     if trades and not any(stem in low for stem in trades):

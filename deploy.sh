@@ -9,8 +9,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 case "${1:-}" in
-  test)       APP=contact-scraper-4b54ea-test; URL=https://contact-scraper-4b54ea-test.azurewebsites.net ;;
-  production) APP=contact-scraper-4b54ea;      URL=https://vendors.crosbyllc.com ;;
+  test)       APP=contact-scraper-4b54ea-test; DB=ContactScraperTest; URL=https://contact-scraper-4b54ea-test.azurewebsites.net ;;
+  production) APP=contact-scraper-4b54ea;      DB=ContactScraper;     URL=https://vendors.crosbyllc.com ;;
   *) echo "Usage: $0 test|production" >&2; exit 2 ;;
 esac
 
@@ -29,6 +29,9 @@ if [ "$1" = production ]; then
     exit 1
   fi
 fi
+
+echo "Updating the $DB database structure (if needed)..."
+.venv/bin/python migrate.py "$DB"
 
 ZIP=$(mktemp -t deploy).zip
 git archive --format=zip -o "$ZIP" HEAD

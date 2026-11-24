@@ -222,6 +222,8 @@ class ScrapeResult:
     insurance_details: dict[str, None] = field(default_factory=dict)  # ordered set of findings
     pages_scraped: list[str] = field(default_factory=list)
     text: str = ""  # visible text of scraped pages, used to sanity-check search matches
+    addresses: dict[str, None] = field(default_factory=dict)       # ordered set of street addresses
+    service_areas: dict[str, None] = field(default_factory=dict)   # ordered set of "serving ..." phrases
 
     def has_contact_info(self) -> bool:
         return bool(self.emails or self.phones)
@@ -619,9 +621,157 @@ def _scrape_page(result: ScrapeResult, url: str, html: str) -> BeautifulSoup:
     result.insurance_terms |= terms
     for item in details:
         result.insurance_details.setdefault(item, None)
+    for addr in extract_addresses(link_soup, text):
+        result.addresses.setdefault(addr, None)
+    for area in extract_service_areas(text):
+        result.service_areas.setdefault(area, None)
     result.pages_scraped.append(url)
     result.text += "\n" + text[:150_000]
     return link_soup
+
+
+# --------------------------------------------------------------------------- #
+# Addresses and service areas
+# --------------------------------------------------------------------------- #
+
+_STREET_TYPES = (r"St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Way|Dr|Drive|Ln|Lane|Ct|Court|Pl|Place|Hwy|"
+                 r"Highway|Pkwy|Parkway|Loop|Cir|Circle|Ter|Terrace|Trl|Trail")
+ADDRESS_RE = re.compile(
+    rf"\b\d{{1,6}}(?:\s+[NSEW]{{1,2}}\.?)?(?:\s+[A-Za-z0-9.'-]+){{1,5}}?\s+(?:{_STREET_TYPES})\b\.?"
+    rf"(?:\s+[NSEW]{{1,2}}\b\.?)?"
+    rf"(?:,?\s+(?:Suite|Ste\.?|Unit|#|Bldg\.?)\s*[\w-]+)?"
+    rf"[,\s]+[A-Z][A-Za-z .'-]{{1,30}},?\s+(?:WA|Washington|OR|Oregon|ID|Idaho)\.?,?\s+\d{{5}}(?:-\d{{4}})?\b"
+)
+SERVICE_AREA_RE = re.compile(
+    r"(?i)\b(?:proudly\s+)?(?:serving|we\s+serve|service\s+areas?|areas?\s+(?:we\s+)?serve[ds]?)\b[:\s-]*"
+    r"((?:the\s+)?[A-Z][^.!?\n]{3,220})")
+
+
+def extract_addresses(soup: BeautifulSoup, text: str) -> list[str]:
+    """Street addresses from schema.org PostalAddress data and from the page text."""
+    found: list[str] = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list):
+                stack.extend(node)
+            elif isinstance(node, dict):
+                if node.get("@type") == "PostalAddress" and node.get("streetAddress"):
+                    parts = [node.get("streetAddress"), node.get("addressLocality"),
+                             " ".join(x for x in (node.get("addressRegion"), node.get("postalCode")) if x)]
+                    found.append(", ".join(str(p).strip() for p in parts if p))
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+    found += [re.sub(r"\s+", " ", m.group(0)).strip(" ,") for m in ADDRESS_RE.finditer(text)]
+    seen, out = set(), []
+    for a in found:
+        key = re.sub(r"[^a-z0-9]", "", a.lower())[:30]
+        if key and key not in seen:
+            seen.add(key)
+            out.append(a)
+    return out[:5]
+
+
+def extract_service_areas(text: str) -> list[str]:
+    """Phrases like "Proudly serving Vancouver, Camas and Battle Ground"."""
+    out = []
+    for m in SERVICE_AREA_RE.finditer(text):
+        phrase = re.sub(r"\s+", " ", m.group(1)).strip(" ,:-")
+        phrase = re.split(r"\s+(?:with|for|including|since|where|who|that)\s+", phrase)[0].strip(" ,:-")
+        # must look like places: a few capitalised words, not a sentence about something else
+        if len(re.findall(r"\b[A-Z][a-z]+", phrase)) >= 2 and not re.search(r"(?i)\byou\b|\bour\b|since\b", phrase[:40]):
+            out.append(phrase[:200])
+    return list(dict.fromkeys(out))[:3]
+
+
+# --------------------------------------------------------------------------- #
+# Deep crawl: several high-value pages per site
+# --------------------------------------------------------------------------- #
+
+# Higher-value pages first; the label or URL must match
+CRAWL_PRIORITIES = [
+    re.compile(r"contact|get[\s_-]?in[\s_-]?touch|reach[\s_-]?us|free[\s_-]?estimate|request[\s_-]?(?:a[\s_-]?)?quote",
+               re.I),
+    re.compile(r"about|who[\s_-]?we[\s_-]?are|our[\s_-]?story|our[\s_-]?company", re.I),
+    re.compile(r"team|staff|our[\s_-]?people|leadership|meet[\s_-]?the|owner", re.I),
+    re.compile(r"service[\s_-]?areas?|areas?[\s_-]?(?:we[\s_-]?)?serve|locations?", re.I),
+    re.compile(r"licen[cs]|insur|bond|credential|warrant", re.I),
+    re.compile(r"services?\b", re.I),
+]
+
+
+def _crawl_candidates(soup: BeautifulSoup, base_url: str, skip: set[str]) -> list[str]:
+    """Same-site links ranked by CRAWL_PRIORITIES (footer links included: they're in the page)."""
+    ranked: dict[str, int] = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        absolute = urljoin(base_url, href).split("#", 1)[0]
+        norm = absolute.rstrip("/")
+        if not _same_domain(absolute, base_url) or norm in skip \
+                or re.search(r"\.(pdf|jpe?g|png|gif|webp|svg|zip|docx?|xlsx?)$", norm, re.I) \
+                or re.search(r"/(blog|news|tag|category|author|wp-content|cart|login|privacy|terms)\b", norm, re.I):
+            continue
+        label = f"{a.get_text(' ', strip=True)} {href}"
+        for rank, pattern in enumerate(CRAWL_PRIORITIES):
+            if pattern.search(label):
+                ranked[absolute] = min(ranked.get(absolute, 99), rank)
+                break
+    return sorted(ranked, key=ranked.get)
+
+
+def crawl_site(raw_url: str, max_pages: int = 6) -> ScrapeResult:
+    """Scrape the homepage plus up to max_pages - 1 contact/about/team/service-area/licensing pages.
+
+    Never raises: failures are reported in ``status``. A page that fails to load is skipped;
+    whatever the other pages yielded is kept.
+    """
+    url = normalize_url(raw_url)
+    result = ScrapeResult(url=raw_url.strip())
+    if url is None:
+        result.status = "Invalid URL"
+        return result
+    with requests.Session() as session:
+        try:
+            final_url, html = fetch_with_fallbacks(session, url)
+        except requests.exceptions.Timeout:
+            result.status = "Connection Error (timeout)"
+            return result
+        except requests.exceptions.HTTPError as exc:
+            result.status = f"Connection Error (HTTP {exc.response.status_code})"
+            return result
+        except requests.exceptions.RequestException:
+            result.status = "Connection Error"
+            return result
+        except Exception as exc:  # noqa: BLE001 - never crash the pipeline
+            result.status = f"Error: {type(exc).__name__}"
+            return result
+        try:
+            soup = _scrape_page(result, final_url, html)
+        except Exception as exc:  # noqa: BLE001
+            result.status = f"Parse Error: {type(exc).__name__}"
+            return result
+        visited = {final_url.rstrip("/"), url.rstrip("/")}
+        failed = 0
+        for link in _crawl_candidates(soup, final_url, visited):
+            if len(result.pages_scraped) >= max_pages:
+                break
+            visited.add(link.rstrip("/"))
+            try:
+                sub_url, sub_html = fetch(session, link)
+                _scrape_page(result, sub_url, sub_html)
+            except Exception:  # noqa: BLE001 - one bad page shouldn't lose the others
+                failed += 1
+        if failed:
+            result.status = f"OK ({failed} page{'s' if failed > 1 else ''} failed to load)"
+    if result.status == "OK" and not (result.emails or result.phones or result.names):
+        result.status = "OK (no contact info found)"
+    return result
 
 
 def scrape_url(raw_url: str) -> ScrapeResult:

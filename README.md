@@ -1,38 +1,23 @@
 # Contact Scraper
 
-A Streamlit app that scrapes websites for contact details: emails, phone numbers, contact names, and insurance or bond details.
+An end-to-end vendor discovery tool: pick trades and areas, and it finds licensed businesses, crawls their websites for contact details, checks their emails, and sorts them into an actionable **Primary** queue and a **Secondary** queue for records missing something critical. No spreadsheets to upload or export in between.
 
-## Vendor spreadsheet mode
+## Scan (🛰️ the home page)
 
-Upload a **CSV or Excel** file, or paste a **Google Sheet** link (shared as "Anyone with the link can view"). For each row the app:
+1. **Trades:** Roofing, Gutters, Plumbing, HVAC, Electrical, Siding, Painting, Landscaping, plus any other trade typed in.
+2. **Areas:** region presets (Western WA / Puget Sound and its submarkets, Southern WA / Vancouver, Eastern WA / Spokane, Central WA, Tri-Cities) and/or custom cities, ZIPs or 3-digit ZIP prefixes. Presets are ZIP-prefix based, so every town in a region is included.
+3. **Critical fields:** which fields a record needs to be in the Primary queue (default: Business name, Website, Phone, Valid email). The choice is saved and used everywhere routing happens.
+4. **Estimate** shows how many active licenses match and roughly how long a scan takes; **Start scan** runs it.
 
-1. Uses the vendor's website from the sheet, or — if it's blank — searches the web for the vendor name (plus any City/State columns) and picks the vendor's own site, skipping directories like Yelp, BBB, Facebook and Angi. The found URL is written into the Website column.
-2. Scrapes that site for **Contact Name, Email, Phone and Insurance or Bond**.
-3. Fills every gap with a clear label, and colour-codes it in the Excel download (a Legend tab explains each value):
+The scan then runs on its own, with a live log and progress counters:
 
-| Value | Meaning |
-|---|---|
-| `Not found` | Site loaded, but that detail isn't on it |
-| `Unknown` | Site doesn't mention insurance, bonding or a licence |
-| `No website` | No site in the sheet and none found by search |
-| `Site unreachable` | Site didn't load (down, blocked, timed out) |
-| `Search failed` | Web search errored (rate limit) — re-run those rows |
-| `Found by search (verify)` | Site found, but its domain doesn't clearly match the name — check it |
+- **Stage 1: discovery.** Queries the [Washington L&I contractor registry](https://data.wa.gov/Labor/L-I-Contractor-License-Data-General/m8qx-ubtq) (public, updated daily) for active licenses matching the trades (by license specialty or type, or a trade word in the business name) in the areas. Each business comes with its name, phone, address, owner and license number. Duplicates across trades and areas are merged by state business ID (UBI), and businesses already in the database (same UBI, name or phone) are merged into the existing record (only empty fields are filled). New records are saved immediately as *Pending*. **Max new businesses per scan** (Advanced) caps how many new ones one scan adds.
+- **Stage 2: deep dive.** For every record from Stage 1: if there's no website, a web search finds one, and it's only accepted if the site carries the registry's phone number or mentions the vendor's name, trade and area (directories, lookalikes and redirecting domains are rejected). Then up to 6 pages per site are crawled (home, contact, about, team, service areas, licensing, services, including footer links) for emails (third-party, tracking and placeholder addresses filtered out), phone numbers, contact names, street address, service area and insurance/licence claims. Found emails are checked, and the record is routed. Only empty fields are ever filled.
+- **Routing:** records with every critical field go to **Primary**; the rest go to **Secondary** with the missing fields listed (`[NO DOMAIN FOUND]`, `[MISSING: EMAIL]`, `[INVALID EMAIL]`, ...). Secondary records are never deleted automatically.
 
-Values already in the sheet (e.g. an existing Email) are kept; only blanks are filled. Columns are auto-detected and can be changed before running. Results download as a colour-coded `.xlsx` or a `.csv` (import into Google Sheets with File → Import).
+Each record is saved as soon as its deep dive finishes, so timeouts, blocked sites and broken pages never lose progress. Scans run in the background: closing the browser tab doesn't stop them. **Cancel** stops after the records in progress; a scan interrupted by an app restart or cancelled can be **resumed** from Recent scans, which also keeps each scan's settings, counts and full log.
 
-Website search tries several free engines in turn (DuckDuckGo, then Bing) and records the reason in **Scrape Status** if all of them fail. Use **Test website search** in the sidebar to check search works on your network. For long lists, add a free **Brave Search API key** in the sidebar for faster, more reliable lookups.
-
-You can re-upload a results file: cells holding `Search failed`, `Not found`, etc. are treated as blank and re-processed.
-
-## Paste URLs mode
-
-- Paste URLs (one per line) and click **Start Scraping**.
-- Sites are scraped concurrently, with live progress and results.
-- If a homepage has no email or phone, one Contact/About page on the same domain is checked.
-- **Insurance or Bond** lists what the site states about the provider's coverage and registration: "Licensed, Bonded & Insured" style claims, licence/registration/bond numbers (e.g. `License #TACLA12345C`, `USDOT 1234567`), coverage types (general liability, workers' compensation, surety bond) and coverage amounts. If none is found on the pages already scraped, one Licensing/Insurance/About page is checked; otherwise the field shows `Unknown`. Mentions of *customers'* insurance (claims, adjusters) are ignored.
-- Each request times out after 5 seconds; failed sites show `Connection Error` instead of crashing the app.
-- Export the results with **Download to Excel** (`.xlsx`).
+Website search uses free engines (DuckDuckGo, then Bing). For big scans, add a free **Brave Search API key** under Advanced for faster, more reliable lookups. Some sites block automated visits; those are logged as unreachable rather than worked around.
 
 ## Setup
 
@@ -53,14 +38,13 @@ On Windows, just double-click `run.bat`. Otherwise:
 
 Then open http://localhost:8501.
 
-## Saving to Azure SQL
+## Storage (Azure SQL)
 
-Both modes have a **💾 Save to Azure SQL** button. Results go into one table, `dbo.Vendors`, with one row per vendor (spreadsheet mode) or per website (pasted URLs). Saving again **updates** the existing row instead of adding a duplicate:
+Everything lives in one Azure SQL database: `dbo.Vendors` (one row per business), `dbo.ScanRuns` (each scan's settings, counts, status and log) and `dbo.AppSettings` (the critical-field choice).
 
-- A newly scraped real value replaces the stored one; a gap marker (`Not found`, `Unknown`, `Site unreachable`…) never overwrites a real stored value.
-- Once a record has been edited in the Database viewer, re-scrapes only fill its empty or gap fields; your hand edits are kept.
-- A pasted URL updates the vendor row that already has that website, if exactly one does.
-- A spreadsheet column named **State** fills the record's `State` (otherwise it's left blank to fill in the viewer). Other spreadsheet columns are kept as JSON in `ExtraData`. `FirstSeen` / `LastScraped` are tracked, and `Notes`, `LastEdited`, `LastEditedBy` are set by the viewer.
+- Scans and rescans only fill empty or gap fields (`Not found`, `No website`, ...); they never overwrite a value that's already there, including hand edits in the viewer.
+- Businesses are matched across scans by state business ID (UBI), name or phone, so re-scanning an area updates records instead of duplicating them.
+- Records from the original spreadsheet imports keep their spreadsheet columns as JSON in `ExtraData`. `FirstSeen`, `LastScraped`, `EnrichedAt` are tracked, and `Notes`, `LastEdited`, `LastEditedBy` are set by the viewer.
 
 The app signs in with your Microsoft Entra ID account through the Azure CLI, so no database password is stored anywhere.
 
@@ -68,13 +52,17 @@ The app signs in with your Microsoft Entra ID account through the Azure CLI, so 
 
 Open **🗂️ Database viewer** in the app's sidebar to browse and update the saved records in a spreadsheet-style grid:
 
+- **Queue switcher:** All records, Primary, or Secondary. The **Missing** column shows which critical fields a record lacks; **Completeness** scores how much is known about it.
+- **⬆️ Promote / ⬇️ Demote** move selected records between queues by hand; they stay there (marked *Moved by hand*) until **↺ Auto-route** hands them back to automatic routing. Editing a record (say, typing in an email you found) re-routes it automatically.
+- **📤 Export queues:** Primary only, Secondary only, or All records with `Queue_Status` and `Missing_Fields` columns, as Excel or CSV. Exports cover the whole queue; **Download this view** exports just the filtered grid.
+
 - **Search** across vendor, type, website, contact, email, phone, insurance and notes.
 - **Show** quick filters: no email, valid phone number, no valid phone number, missing contact name or insurance, email problems, emails not checked yet, website needs checking, edited by hand.
 - **Filter** by Added from (spreadsheet, URL list, manual), **Vendor type**, **Onboarded** and **Liability insurance**.
 - **Sort by** any column, ascending or descending, on top of any filter. The default is last activity, newest first.
 - **Edit** a cell by clicking it (press Enter to open it, Enter again to keep the change). Vendor, vendor type, state, onboarded, liability insurance, website, contact name, email, phone, insurance or bond, and notes are editable; dates and scrape details are read-only.
 - **Select** records with the ✔ column (or **Select all shown**), then:
-  - **🔄 Rescan selected** looks for missing contact name, email, phone, insurance and vendor type on each vendor's website, and searches for a website when there isn't one (using the same checks as spreadsheet mode). It only fills empty or "Not found" fields; it never changes existing values, including hand edits.
+  - **🔄 Rescan selected** runs the Stage 2 deep dive again on those records (finding a website if missing, crawling it, checking emails, re-routing). It only fills empty or "Not found" fields; it never changes existing values, including hand edits.
   - **✉️ Check emails** checks each address for a bad format, a typo in a common domain (gmial.com), placeholder or system addresses, throwaway inboxes, and domains that don't exist or can't receive mail. Results go in **Email check**. These free checks can't confirm that a specific mailbox exists at a working domain; only sending a message (or a paid verification service) can.
 - **Add** a record in the empty last row. **Delete** by selecting rows by their left edge and pressing Delete; you confirm before anything is removed.
 - Nothing is written until **Save changes**. Each change records who made it and when. If a record was re-scraped or edited elsewhere after you loaded it, your change to that record is skipped and reported instead of overwriting newer data.
@@ -187,12 +175,15 @@ Install spaCy and its English model; the scraper uses it automatically when pres
 ## Files
 
 - `app.py`: entry point, page navigation and the TEST banner
+- `scan_page.py`: Scan page (scan settings, estimate, live progress, history, resume)
+- `pipeline.py`: the background scan pipeline (Stage 1, Stage 2 deep dive, routing, resume)
+- `discovery.py`: Stage 1 sources (WA L&I registry), trades and area presets
+- `routing.py`: critical fields and Primary/Secondary routing
+- `migrate.py`: brings a database's structure up to date (run by deploy.sh)
 - `deploy.sh`: deploys the committed code to the test or production web app
 - `refresh_test_db.py`: replaces the test database's records with a copy of production's
-- `scraper_page.py`: scraper UI (spreadsheet + URL modes, progress, results, exports, save to Azure SQL)
-- `viewer_page.py`: Database viewer (browse, filter, sort, edit, add, delete, rescan, email check, export)
-- `rescan.py`: rescans selected records and fills only their missing fields
+- `viewer_page.py`: Database viewer (queues, browse, filter, sort, edit, add, delete, rescan, email check, promote/demote, exports)
 - `checks.py`: phone number validity and email deliverability checks
-- `enrich.py`: spreadsheet loading (CSV/Excel/Google Sheets), website search, row enrichment, colour-coded Excel export
+- `enrich.py`: website search and verification, vendor types, name cleaning
 - `db.py`: Azure SQL storage (connection, `dbo.Vendors` table, save/update logic, viewer reads and edits)
-- `scraper.py`: scraping engine (fetching, link following, email/phone/name extraction)
+- `scraper.py`: scraping engine (fetching, multi-page crawl, email/phone/name/address/service-area/insurance extraction)
