@@ -219,6 +219,11 @@ DIRECTORY_DOMAINS |= {
     "findtrustedroofers.com", "findroofingpros.com", "washratings.com", "roofreport.net", "listcentral.us",
     "namesandnumbers.com", "provenexpert.com", "usbizs.com", "roof.info", "zoom.earth", "visitvancouverwa.com",
     "101apartmentforrent.com", "roofmyspace.com", "clearme.com", "bizofwa.com", "licensedhvactexas.com",
+    # home-improvement media and retailers that rank for trade searches
+    "thisoldhouse.com", "bobvila.com", "forbes.com", "todayshomeowner.com", "familyhandyman.com", "bankrate.com",
+    "nerdwallet.com", "consumeraffairs.com", "homedepot.com", "lowes.com", "angi.com", "bhg.com", "hgtv.com",
+    "architecturaldigest.com", "realtor.com", "investopedia.com", "roofingcalc.com", "fixr.com", "homeguide.com",
+    "inspectapedia.com", "gaf.com", "owenscorning.com", "certainteed.com", "iko.com", "atlasroofing.com",
 }
 # Words in a domain that mark lead-gen/directory/listing sites rather than a vendor's own site
 DIRECTORY_WORDS = re.compile(
@@ -381,7 +386,9 @@ class WebSearch:
     """Rate-limited web search with fallbacks.
 
     Brave Search API (if a key is given) → ddgs library → DuckDuckGo HTML → Bing HTML.
-    An engine that errors is skipped for the rest of the run after repeated failures.
+    An engine that errors (usually a rate limit) is rested for a while that grows with repeated
+    failures, then tried again. An engine that answers a different query with exactly the same
+    results as the last one is treated as degraded too (Bing does this when it throttles).
     """
 
     def __init__(self, brave_api_key: str = "", min_interval: float = 1.0):
@@ -390,6 +397,8 @@ class WebSearch:
         self._lock = threading.Lock()
         self._last = 0.0
         self.failures: dict[str, int] = {}
+        self.rest_until: dict[str, float] = {}
+        self._last_result: dict[str, tuple[str, tuple]] = {}
         self.last_engine = ""
         self.engines = ([("Brave", self._brave)] if self.brave_key else []) + [
             ("ddgs", _ddgs_lib), ("DuckDuckGo", _ddg_html), ("Bing", _bing_html)]
@@ -420,29 +429,42 @@ class WebSearch:
     def _ddg(self, query: str) -> list[dict]:
         return _ddgs_lib(query)
 
-    def search(self, query: str, max_results: int = 10) -> list[dict]:
+    def search(self, query: str, max_results: int = 10, local: bool = False) -> list[dict]:
+        """Results for the query. local=True skips Bing's HTML page, which ignores the place in the query."""
+        engines = [(n, e) for n, e in self.engines if not (local and n == "Bing")]
         errors = []
-        for attempt in range(2):
-            for name, engine in self.engines:
-                if self.failures.get(name, 0) >= 3:
-                    continue  # this engine keeps failing on this network; stop trying it
+        for attempt in range(3):
+            # If every engine is resting, wait for the first to be ready rather than giving up
+            waits = [self.rest_until.get(n, 0) - time.monotonic() for n, _ in engines]
+            if waits and min(waits) > 0:
+                time.sleep(min(min(waits), 120))
+            for name, engine in engines:
+                if time.monotonic() < self.rest_until.get(name, 0):
+                    continue  # resting after failures (likely rate-limited); tried again later
                 self._wait_turn()
                 try:
                     results = (_ddgs_lib(query, max_results) if name == "ddgs" else engine(query))
+                    urls = tuple(r.get("url", "") for r in results)
+                    prev_query, prev_urls = self._last_result.get(name, ("", ()))
+                    if urls and urls == prev_urls and query != prev_query:
+                        raise SearchError("same results as the previous query (throttled)")
+                    self._last_result[name] = (query, urls)
                 except Exception as exc:  # noqa: BLE001 - try the next engine
                     with self._lock:
                         self.failures[name] = self.failures.get(name, 0) + 1
+                        # 20 s, 40 s, 80 s ... up to 5 minutes
+                        self.rest_until[name] = time.monotonic() + min(300, 20 * 2 ** (self.failures[name] - 1))
                     msg = str(exc).strip().splitlines()[0][:80] if str(exc).strip() else ""
                     errors.append(f"{name}: {type(exc).__name__}{' ' + msg if msg else ''}")
                     continue
                 with self._lock:
                     self.failures[name] = 0
+                    self.rest_until.pop(name, None)
                     self.last_engine = name
                 if results:
                     return results
             if not errors:
                 return []  # every engine answered with no results
-            time.sleep(2 * (attempt + 1))
         raise SearchError("; ".join(dict.fromkeys(errors))[:300] or "all search engines failed")
 
 

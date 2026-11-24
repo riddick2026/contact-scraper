@@ -73,25 +73,30 @@ class Trade:
     tx_tdlr: tuple = ()          # Texas TDLR license types
     tx_tsbpe: bool = False       # Texas plumbing board list
     stem: str = ""               # word a matching website must mention (web discovery check)
+    search_alt: tuple = ()       # more phrasings for web search; different words surface different businesses
 
 
 TRADES = {
     t.label: t for t in [
-        Trade("Roofing", "Roofers", "roofing contractor", specialties=("CD",), name_words=("ROOF",), stem="roof"),
+        Trade("Roofing", "Roofers", "roofing contractor", specialties=("CD",), name_words=("ROOF",), stem="roof",
+              search_alt=("roofing company", "roof repair", "roofer", "roof replacement")),
         Trade("Gutters", "Gutters", "gutter installation company", specialties=("CV",), name_words=("GUTTER",),
-              stem="gutter"),
+              stem="gutter", search_alt=("seamless gutters", "gutter company", "gutter repair")),
         Trade("Plumbing", "Plumbers", "plumbing company", license_types=("PC",), name_words=("PLUMB", "ROOTER"),
-              or_bcd=("PB",), tx_tsbpe=True, stem="plumb"),
+              or_bcd=("PB",), tx_tsbpe=True, stem="plumb", search_alt=("plumber", "plumbing repair", "drain cleaning")),
         Trade("HVAC", "HVAC", "HVAC heating and air conditioning company", specialties=("SM", "6A", "6B"),
               name_words=("HVAC", "HEATING", "AIR CONDITION"), or_bcd=("LHR",), tx_tdlr=("A/C Contractor",),
-              stem="hvac|heating|air condition|furnace"),
+              stem="hvac|heating|air condition|furnace",
+              search_alt=("ac repair", "heating and cooling company", "air conditioning contractor")),
         Trade("Electrical", "Electricians", "electrical contractor", license_types=("EC",), name_words=("ELECTRIC",),
-              or_bcd=("C-",), tx_tdlr=("Electrical Contractor",), stem="electric"),
-        Trade("Siding", "Siding", "siding contractor", specialties=("SW",), name_words=("SIDING",), stem="siding"),
+              or_bcd=("C-",), tx_tdlr=("Electrical Contractor",), stem="electric",
+              search_alt=("electrician", "electrical services")),
+        Trade("Siding", "Siding", "siding contractor", specialties=("SW",), name_words=("SIDING",), stem="siding",
+              search_alt=("siding installation", "siding company")),
         Trade("Painting", "Painters", "house painting contractor", specialties=("CB",), name_words=("PAINT",),
-              stem="paint"),
+              stem="paint", search_alt=("house painters", "painting company")),
         Trade("Landscaping", "Landscapers", "landscaping company", specialties=("BW",), name_words=("LANDSCAP",),
-              stem="landscap"),
+              stem="landscap", search_alt=("landscaper", "landscape contractor")),
     ]
 }
 
@@ -100,7 +105,7 @@ def custom_trade(text: str) -> Trade:
     """A free-text trade: matches the word in business names (and WA specialty descriptions)."""
     word = re.sub(r"[^A-Za-z ]", "", text).strip()
     return Trade(word.title(), word.title(), f"{word.lower()} company", name_words=(word.upper(),),
-                 stem=word.lower().rstrip("s")[:8])
+                 stem=word.lower().rstrip("s")[:8], search_alt=(f"{word.lower()} services", f"{word.lower()} contractor"))
 
 
 def sources_for(state: str, trade: Trade) -> list[str]:
@@ -163,51 +168,45 @@ AREA_PRESETS: dict[str, dict[str, dict]] = {
     },
     "ID": {
         "Boise / Treasure Valley": {"zip_prefixes": ["836", "837"],
-                                    "search": ["Boise", "Meridian", "Nampa", "Caldwell", "Eagle"]},
+                                    "search": ["Boise", "Meridian", "Nampa", "Caldwell", "Eagle", "Kuna", "Star", "Garden City", "Mountain Home", "Emmett"]},
         "North Idaho (Coeur d'Alene / Sandpoint)": {"zip_prefixes": ["838"],
-                                                    "search": ["Coeur d'Alene", "Post Falls", "Sandpoint",
-                                                               "Hayden"]},
-        "North Central Idaho (Lewiston / Moscow)": {"zip_prefixes": ["835"], "search": ["Lewiston", "Moscow"]},
-        "Magic Valley (Twin Falls)": {"zip_prefixes": ["833"], "search": ["Twin Falls", "Jerome", "Burley"]},
+                                                    "search": ["Coeur d'Alene", "Post Falls", "Sandpoint", "Hayden", "Rathdrum", "Bonners Ferry"]},
+        "North Central Idaho (Lewiston / Moscow)": {"zip_prefixes": ["835"], "search": ["Lewiston", "Moscow", "Orofino", "Grangeville"]},
+        "Magic Valley (Twin Falls)": {"zip_prefixes": ["833"], "search": ["Twin Falls", "Jerome", "Burley", "Rupert", "Gooding", "Hailey", "Ketchum"]},
         "Eastern Idaho (Idaho Falls / Pocatello)": {"zip_prefixes": ["832", "834"],
-                                                    "search": ["Idaho Falls", "Pocatello", "Rexburg",
-                                                               "Blackfoot"]},
+                                                    "search": ["Idaho Falls", "Pocatello", "Rexburg", "Blackfoot", "Ammon", "Chubbuck", "Rigby", "Shelley"]},
     },
     "TX": {
         "Dallas-Fort Worth": {"counties": ["DALLAS", "TARRANT", "COLLIN", "DENTON", "ROCKWALL", "KAUFMAN", "ELLIS",
                                            "JOHNSON", "PARKER"],
-                              "search": ["Dallas", "Fort Worth", "Plano", "Arlington", "Frisco", "Irving",
-                                         "McKinney", "Denton"]},
+                              "search": ["Dallas", "Fort Worth", "Arlington", "Plano", "Garland", "Irving", "Grand Prairie", "McKinney", "Frisco", "Mesquite", "Denton", "Carrollton", "Richardson", "Lewisville", "Allen", "Flower Mound", "Mansfield", "North Richland Hills", "Euless", "Grapevine", "Keller", "Wylie", "Rowlett", "Rockwall", "Little Elm", "Prosper", "Cedar Hill", "DeSoto", "Burleson", "Weatherford", "Waxahachie", "Southlake", "Coppell", "The Colony"]},
         "Houston": {"counties": ["HARRIS", "FORT BEND", "MONTGOMERY", "BRAZORIA", "GALVESTON"],
-                    "search": ["Houston", "Sugar Land", "The Woodlands", "Katy", "Pearland", "League City"]},
+                    "search": ["Houston", "Pasadena", "Pearland", "League City", "Sugar Land", "Baytown", "Conroe", "The Woodlands", "Katy", "Missouri City", "Friendswood", "Spring", "Cypress", "Humble", "Kingwood", "Tomball", "Galveston", "Texas City", "Rosenberg", "Richmond", "Magnolia", "Atascocita", "Fulshear", "Seabrook"]},
         "Austin": {"counties": ["TRAVIS", "WILLIAMSON", "HAYS"],
-                   "search": ["Austin", "Round Rock", "Georgetown", "Cedar Park", "San Marcos"]},
+                   "search": ["Austin", "Round Rock", "Cedar Park", "Georgetown", "Pflugerville", "Leander", "San Marcos", "Kyle", "Buda", "Hutto", "Lakeway", "Dripping Springs", "Bee Cave", "Taylor", "Manor"]},
         "San Antonio": {"counties": ["BEXAR", "COMAL", "GUADALUPE"],
-                        "search": ["San Antonio", "New Braunfels", "Schertz"]},
-        "El Paso": {"counties": ["EL PASO"], "search": ["El Paso"]},
+                        "search": ["San Antonio", "New Braunfels", "Schertz", "Seguin", "Boerne", "Converse", "Universal City", "Helotes", "Cibolo", "Live Oak", "Leon Valley"]},
+        "El Paso": {"counties": ["EL PASO"], "search": ["El Paso", "Socorro", "Horizon City", "Canutillo"]},
         "Rio Grande Valley": {"counties": ["HIDALGO", "CAMERON"],
-                              "search": ["McAllen", "Brownsville", "Harlingen", "Edinburg"]},
-        "Corpus Christi": {"counties": ["NUECES", "SAN PATRICIO"], "search": ["Corpus Christi"]},
+                              "search": ["McAllen", "Brownsville", "Harlingen", "Edinburg", "Mission", "Pharr", "Weslaco", "San Benito"]},
+        "Corpus Christi": {"counties": ["NUECES", "SAN PATRICIO"], "search": ["Corpus Christi", "Portland", "Robstown", "Aransas Pass", "Rockport", "Kingsville"]},
         "West Texas (Lubbock / Amarillo / Midland-Odessa)": {"counties": ["LUBBOCK", "POTTER", "RANDALL", "MIDLAND",
                                                                           "ECTOR"],
-                                                             "search": ["Lubbock", "Amarillo", "Midland",
-                                                                        "Odessa"]},
-        "East Texas (Tyler / Longview)": {"counties": ["SMITH", "GREGG"], "search": ["Tyler", "Longview"]},
+                                                             "search": ["Lubbock", "Amarillo", "Midland", "Odessa", "Canyon", "Wolfforth", "Big Spring"]},
+        "East Texas (Tyler / Longview)": {"counties": ["SMITH", "GREGG"], "search": ["Tyler", "Longview", "Kilgore", "Marshall", "Jacksonville", "Whitehouse", "Lindale"]},
         "Central Texas (Waco / Killeen / Temple)": {"counties": ["MCLENNAN", "BELL"],
-                                                    "search": ["Waco", "Killeen", "Temple"]},
+                                                    "search": ["Waco", "Killeen", "Temple", "Belton", "Harker Heights", "Copperas Cove", "Hewitt"]},
     },
     "OK": {
         "Oklahoma City Metro": {"zip_prefixes": ["730", "731"],
-                                "search": ["Oklahoma City", "Edmond", "Norman", "Moore", "Yukon", "Midwest City"]},
+                                "search": ["Oklahoma City", "Edmond", "Norman", "Moore", "Yukon", "Midwest City", "Mustang", "Del City", "Bethany", "Piedmont", "Choctaw", "Shawnee", "Guthrie", "Newcastle", "El Reno"]},
         "Tulsa Metro": {"zip_prefixes": ["740", "741"],
-                        "search": ["Tulsa", "Broken Arrow", "Owasso", "Jenks", "Sand Springs"]},
-        "Southwest Oklahoma (Lawton)": {"zip_prefixes": ["735"], "search": ["Lawton", "Duncan"]},
+                        "search": ["Tulsa", "Broken Arrow", "Owasso", "Jenks", "Sand Springs", "Bixby", "Sapulpa", "Claremore", "Glenpool", "Coweta", "Catoosa", "Skiatook"]},
+        "Southwest Oklahoma (Lawton)": {"zip_prefixes": ["735"], "search": ["Lawton", "Duncan", "Altus", "Chickasha"]},
         "North Central Oklahoma (Enid / Stillwater / Ponca City)": {"zip_prefixes": ["737"],
-                                                                    "search": ["Enid", "Stillwater",
-                                                                               "Ponca City"]},
-        "Eastern Oklahoma (Muskogee / McAlester / Bartlesville)": {"search": ["Muskogee", "McAlester",
-                                                                             "Bartlesville", "Tahlequah"]},
-        "Southern Oklahoma (Ardmore / Durant)": {"search": ["Ardmore", "Durant", "Ada"]},
+                                                                    "search": ["Enid", "Stillwater", "Ponca City", "Perry"]},
+        "Eastern Oklahoma (Muskogee / McAlester / Bartlesville)": {"search": ["Muskogee", "McAlester", "Bartlesville", "Tahlequah", "Okmulgee", "Wagoner", "Pryor"]},
+        "Southern Oklahoma (Ardmore / Durant)": {"search": ["Ardmore", "Durant", "Ada", "Marietta", "Atoka"]},
     },
 }
 
@@ -642,43 +641,64 @@ def _check_candidate(url: str, trade: Trade, area: AreaFilter, place: str) -> Di
 
 
 def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print) -> list[Discovered]:
-    """Search '[trade] [city] [state]' for each place in the area and keep verified business sites."""
+    """Search several phrasings of '[trade] [city], [state]' for each place in the area; keep verified business sites.
+
+    Site checks run in the background while the next place is searched, so a long city list
+    costs little more than the searches themselves. Stops once `limit` businesses are verified.
+    """
     from enrich import SearchError, _is_directory, _registered_domain
 
     seen_domains: set[str] = set()
     seen_phones: set[str] = set()
     found: list[Discovered] = []
     places = area.search_places or [STATES[area.state]]
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    state_name = STATES[area.state]  # full name: engines misread "OK", "OR", "ID"
+    phrasings = [trade.search, *trade.search_alt]
+    search.min_interval = max(search.min_interval, 1.5)  # many searches in a row: pace them to avoid rate limits
+
+    def harvest(pending: list, place_counts: dict, wait: bool) -> None:
+        """Collect finished site checks (all of them if wait=True), de-duplicating by phone number."""
+        for item in list(pending):
+            fut, place = item
+            if not (wait or fut.done()):
+                continue
+            pending.remove(item)
+            d = fut.result()
+            key = re.sub(r"\D", "", d.phone or "")[-10:] if d else ""
+            if d and not (key and key in seen_phones) and len(found) < limit:  # lead-gen networks reuse numbers
+                if key:
+                    seen_phones.add(key)
+                found.append(d)
+                place_counts[place] = place_counts.get(place, 0) + 1
+
+    pending: list = []
+    verified: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
         for place in places:
+            harvest(pending, verified, wait=False)
             if len(found) >= limit:
                 break
+            queries = [f"{phrasings[0]} {place}, {state_name}"] + [
+                f"{p} {place} {state_name} {NO_DIRECTORIES}" for p in phrasings[1:]]
             results = []
-            state_name = STATES[area.state]  # full name: engines misread "OK", "OR", "ID"
-            for query in (f"{trade.search} {place}, {state_name}",
-                          f"{trade.vendor_type.lower()} {place} {state_name} {NO_DIRECTORIES}",
-                          f"local {trade.search} near {place} {state_name} {NO_DIRECTORIES}"):
+            for query in queries:
                 try:
-                    results += search.search(query, max_results=25)
+                    results += search.search(query, max_results=30, local=True)
                 except SearchError as exc:
                     log(f"Stage 1: web search failed for '{query}' ({exc})")
-            urls = []
+            new_urls = 0
             for r in results:
                 url = r.get("url", "")
                 dom = _registered_domain(urlparse(url).hostname or "")
                 if not url.startswith("http") or not dom or dom in seen_domains or _is_directory(url, r.get("title", "")):
                     continue
                 seen_domains.add(dom)
-                urls.append(url)
-            kept = []
-            for d in pool.map(lambda u: _check_candidate(u, trade, area, place), urls):
-                key = re.sub(r"\D", "", d.phone or "")[-10:] if d else ""
-                if d and not (key and key in seen_phones):  # one site per phone: lead-gen networks reuse numbers
-                    seen_phones.add(key)
-                    kept.append(d)
-            found += kept
-            log(f"Stage 1: {trade.label} in {place}: {len(results)} search results, {len(urls)} candidate sites, "
-                f"{len(kept)} verified businesses")
+                pending.append((pool.submit(_check_candidate, url, trade, area, place), place))
+                new_urls += 1
+            log(f"Stage 1: {trade.label} in {place}: {len(results)} search results, {new_urls} new candidate sites "
+                f"({len(found)} verified so far)")
+        harvest(pending, verified, wait=True)
+    log(f"Stage 1: {trade.label} web search: {len(found)} verified businesses across {len(places)} places")
     return found[:limit]
 
 
