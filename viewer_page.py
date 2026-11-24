@@ -72,7 +72,7 @@ def sort_view(df: pd.DataFrame, label: str, descending: bool) -> pd.DataFrame:
 # UI
 # --------------------------------------------------------------------------- #
 
-st.title("🗂️ Database viewer")
+st.header("🗂️ Database viewer")
 
 try:
     cfg = db.load_config()

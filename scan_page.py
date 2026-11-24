@@ -13,7 +13,7 @@ import pipeline
 import records_ui as ui
 import routing
 
-st.title("🛰️ Scan for vendors")
+st.header("🛰️ Scan for vendors")
 st.caption("Finds businesses for the trades and areas you pick (from each state's contractor license data where it "
            "exists, otherwise by web search), crawls each one's website for contact details, and sorts them into the "
            "**Primary** queue (all critical fields found) or the **Secondary** queue (something missing). Results are "

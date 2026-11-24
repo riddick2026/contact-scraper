@@ -774,7 +774,8 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
     Existing records only get empty fields filled. New records, and existing ones not deep-dived in
     the last REDIVE_AFTER_DAYS days, are queued for the deep dive (EnrichmentStatus = 'Pending');
     all are tagged with the run. Returns (new, matched existing, matched but recently deep-dived).
-    `limit` caps how many *new* records are added.
+    `limit` caps how many *new* records are added. Safe to call repeatedly for one run (Stage 1
+    saves in batches): records the run already holds are only gap-filled, not counted again.
     """
     conn = connect(cfg)
     try:
@@ -790,6 +791,9 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
         by_name = {_name_key(e["VendorName"]): e for e in existing if e["VendorName"]}
         by_phone = {p: e for e in existing for p in _phone_keys(e["Phone"])}
         by_domain = {e["WebsiteDomain"]: e for e in existing if e["WebsiteDomain"]}
+        # Records this run already saved in an earlier batch: refresh their gaps, but don't count them again
+        cur.execute("SELECT VendorId FROM dbo.ScanRunRecords WHERE ScanRunId = ?", [run_id])
+        in_run = {int(r[0]) for r in cur.fetchall()}
 
         inserts, updates, seen = [], [], set()
         for it in items:
@@ -799,7 +803,7 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
                 or by_name.get(_name_key(it.name)) \
                 or next((by_phone[p] for p in _phone_keys(it.phone) if p in by_phone), None)
             if match:
-                if match["Id"] in seen:
+                if match["Id"] is None or match["Id"] in seen:  # None: inserted earlier in this batch
                     continue
                 seen.add(match["Id"])
                 fill = {"UBI": it.ubi, "Region": it.region}
@@ -828,11 +832,14 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
 
         fresh_ids = {e["Id"] for e in existing if e["Fresh"]}
         members = {rec_id: ("Already in database (recent)" if rec_id in fresh_ids else "Already in database")
-                   for rec_id, _ in updates}
+                   for rec_id, _ in updates if rec_id not in in_run}
         for rec_id, fill in updates:
-            fill["ScanRunId"] = run_id
-            if rec_id not in fresh_ids:
-                fill["EnrichmentStatus"] = "Pending"
+            if rec_id not in in_run:
+                fill["ScanRunId"] = run_id
+                if rec_id not in fresh_ids:
+                    fill["EnrichmentStatus"] = "Pending"
+            if not fill:
+                continue
             cur.execute(f"UPDATE dbo.Vendors SET {', '.join(f'{c} = ?' for c in fill)} WHERE Id = ?",
                         [*fill.values(), rec_id])
         if inserts:
@@ -851,7 +858,8 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
                             "EXISTS (SELECT 1 FROM dbo.ScanRunRecords WHERE ScanRunId = ? AND VendorId = ?)",
                             [[run_id, vid, outcome, run_id, vid] for vid, outcome in members.items()])
         conn.commit()
-        return len(inserts), len(updates), sum(1 for rec_id, _ in updates if rec_id in fresh_ids)
+        counted = [rec_id for rec_id, _ in updates if rec_id not in in_run]
+        return len(inserts), len(counted), sum(1 for rec_id in counted if rec_id in fresh_ids)
     except Exception as exc:  # noqa: BLE001
         conn.rollback()
         raise DbError(_friendly(exc)) from exc

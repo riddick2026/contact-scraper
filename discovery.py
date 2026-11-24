@@ -643,14 +643,20 @@ def _check_candidate(url: str, trade: Trade, area: AreaFilter, place: str) -> Di
 WEB_TIME_BUDGET = 600  # seconds of web searching per trade before Stage 1 moves on
 
 
+WEB_SAVE_EVERY = 10  # hand verified businesses to `on_found` in batches of this size (and at each round's end)
+
+
 def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print,
-                 time_budget: float = WEB_TIME_BUDGET) -> list[Discovered]:
+                 time_budget: float = WEB_TIME_BUDGET, on_found=None, cancel=None) -> list[Discovered]:
     """Find verified business sites for the trade by searching the area's towns, breadth-first.
 
     Round 1 searches the main phrasing ("roofing contractor <town>, <state>") in every town, round 2
     the next phrasing in every town, and so on. It stops when `limit` businesses are verified, when
     a round turns up almost nothing new (the area is covered), or when `time_budget` runs out.
     Site checks run in the background while searching continues.
+
+    `on_found(items)` receives verified businesses in small batches while searching continues, so
+    they can be saved before the search ends. `cancel` (a threading.Event) stops the search early.
     """
     from enrich import SearchError, _is_directory, _registered_domain
 
@@ -676,6 +682,14 @@ def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print,
                     seen_phones.add(key)
                 found.append(d)
 
+    handed_over = 0
+
+    def hand_over(force: bool) -> None:
+        nonlocal handed_over
+        if on_found and len(found) > handed_over and (force or len(found) - handed_over >= WEB_SAVE_EVERY):
+            batch, handed_over = found[handed_over:], len(found)
+            on_found(batch)
+
     pending: list = []
     stop = ""
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -683,6 +697,10 @@ def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print,
             searched = new_candidates = 0
             for place in places:
                 harvest(pending, wait=False)
+                hand_over(force=False)
+                if cancel is not None and cancel.is_set():
+                    stop = "was cancelled"
+                    break
                 if len(found) >= limit:
                     stop = f"reached the limit of {limit}"
                     break
@@ -707,6 +725,7 @@ def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print,
                     pending.append(pool.submit(_check_candidate, url, trade, area, place))
                     new_candidates += 1
             harvest(pending, wait=True)
+            hand_over(force=True)
             log(f"Stage 1: {trade.label} web search round {rnd} ('{phrase}'): {searched} towns searched, "
                 f"{new_candidates} new candidate sites; {len(found)} verified businesses so far "
                 f"({time.monotonic() - started:.0f}s)")
@@ -716,7 +735,7 @@ def discover_web(trade: Trade, area: AreaFilter, search, limit: int, log=print,
                 stop = "found almost nothing new in the last round (area covered)"
                 break
     log(f"Stage 1: {trade.label} web search finished: {len(found)} verified businesses in "
-        f"{time.monotonic() - started:.0f}s" + (f"; stopped because it {stop}" if stop.startswith(("reached", "used"))
+        f"{time.monotonic() - started:.0f}s" + (f"; stopped because it {stop}" if stop.startswith(("reached", "used", "was"))
                                                  else f" ({stop})" if stop else ""))
     return found[:limit]
 
@@ -760,15 +779,19 @@ def _dedupe_key(d: Discovered) -> str:
 
 
 def discover(state: str, trades: list[Trade], area: AreaFilter, search=None, web_limit: int = 100,
-             log=print) -> list[Discovered]:
+             log=print, on_found=None, cancel=None) -> list[Discovered]:
     """Businesses for the trades in the area, from the state's sources, with duplicates merged.
 
     A business found for several trades (or by several sources) keeps the first one's record,
-    with empty fields filled from the others.
+    with empty fields filled from the others. If `on_found` is given, it receives each source's
+    results as soon as they are in (web search: in small batches), so they can be saved right
+    away; it may see the same business more than once. `cancel` stops discovery early.
     """
     merged: dict[str, Discovered] = {}
     for trade in trades:
         for src in sources_for(state, trade):
+            if cancel is not None and cancel.is_set():
+                return list(merged.values())
             try:
                 if src == SOURCE_WA:
                     items = discover_wa(trade, area)
@@ -781,10 +804,12 @@ def discover(state: str, trades: list[Trade], area: AreaFilter, search=None, web
                 elif src == SOURCE_TX_TSBPE:
                     items = discover_tx_tsbpe(trade, area)
                 else:
-                    items = discover_web(trade, area, search, web_limit, log)
+                    items = discover_web(trade, area, search, web_limit, log, on_found=on_found, cancel=cancel)
             except requests.RequestException as exc:
                 log(f"Stage 1: {src} unavailable for {trade.label} ({exc}); skipped")
                 continue
+            if on_found and src != SOURCE_WEB and items:  # web search hands its results over as it goes
+                on_found(items)
             new = 0
             for d in items:
                 key = _dedupe_key(d)

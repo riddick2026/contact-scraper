@@ -152,10 +152,32 @@ def _run(cfg, run_id: int, params: ScanParams, state: RunState, discover: bool) 
             plan = "; ".join(f"{t.label}: {', '.join(discovery.sources_for(params.state, t))}" for t in trades)
             _log(cfg, state, f"Stage 1: {discovery.STATES[params.state]}, {', '.join(area.labels)} ({plan})",
                  force=True)
+            # Each batch is saved as soon as it's found, so an interrupted Stage 1 keeps what it found
+            # (resume then deep-dives it).
+            totals = {"new": 0, "matched": 0, "fresh": 0}
+
+            def save_batch(batch: list) -> None:
+                room = max(0, params.max_new - totals["new"])
+                try:
+                    new, matched, fresh = db.merge_discovered(cfg, run_id, batch, limit=room)
+                except db.DbError as exc:
+                    _log(cfg, state, f"Stage 1: couldn't save {len(batch)} businesses yet ({exc}); "
+                                     "they'll be saved at the end of Stage 1")
+                    return
+                totals["new"] += new
+                totals["matched"] += matched
+                totals["fresh"] += fresh
+                state.stage = f"Stage 1: discovery ({totals['new'] + totals['matched']} saved so far)"
+                _log(cfg, state, f"Stage 1: saved {totals['new']} new businesses so far "
+                                 f"({totals['matched']} already in the database)")
+                db.update_run(cfg, run_id, NewRecords=totals["new"])
+
             items = discovery.discover(params.state, trades, area, search=enrich.WebSearch(params.brave_key),
-                                       web_limit=params.max_new, log=lambda m: _log(cfg, state, m))
+                                       web_limit=params.max_new, log=lambda m: _log(cfg, state, m),
+                                       on_found=save_batch, cancel=state.cancel)
             _log(cfg, state, f"Stage 1: discovered {len(items)} unique businesses (duplicates across trades/areas merged)")
-            new, matched, fresh = db.merge_discovered(cfg, run_id, items, limit=params.max_new)
+            save_batch(items)  # catches anything a failed batch missed; already-saved ones aren't counted again
+            new, matched, fresh = totals["new"], totals["matched"], totals["fresh"]
             skipped = max(0, len(items) - matched - new)
             _log(cfg, state, f"Stage 1: {new} new records added, {matched} already in the database (gaps filled"
                              + (f"; {fresh} deep-dived in the last {db.REDIVE_AFTER_DAYS} days, not crawled again"

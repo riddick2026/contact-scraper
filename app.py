@@ -9,7 +9,9 @@ import streamlit as st
 environment = db.app_environment()
 is_test = environment != "production"
 
-st.set_page_config(page_title="Contact Scraper" + (f" ({environment.upper()})" if is_test else ""),
+APP_NAME = "Foundry Wright Trade Vendor Contact Scanning Tool"
+
+st.set_page_config(page_title=APP_NAME + (f" ({environment.upper()})" if is_test else ""),
                    page_icon="🧪" if is_test else "🔎", layout="wide")
 
 if is_test:
@@ -19,6 +21,8 @@ if is_test:
         🧪 {environment.upper()} ENVIRONMENT · changes here don't affect production data</div>""",
         unsafe_allow_html=True,
     )
+
+st.title(APP_NAME)
 
 page = st.navigation([
     st.Page("scan_page.py", title="Scan", icon="🛰️", default=True),
