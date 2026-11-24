@@ -134,13 +134,40 @@ The whole app (scraper and Database viewer) also runs on Azure at **https://vend
 
 - **Scraping from Azure:** some websites and search engines block data-centre IPs, so the hosted scraper may find fewer websites than running it on your own computer.
 
-### Deploy an update
+## Test environment
 
-After pushing changes to GitHub, redeploy from a clone of the repo:
+A separate copy of the app for trying changes before they reach production:
+
+| | Production | Test |
+|---|---|---|
+| Site | https://vendors.crosbyllc.com | https://contact-scraper-4b54ea-test.azurewebsites.net |
+| Web app | `contact-scraper-4b54ea` | `contact-scraper-4b54ea-test` (same B1 plan, no extra cost) |
+| Database | `ContactScraper` | `ContactScraperTest` (free offer; started as a copy of production) |
+| Git branch | `main` | `test` |
+| Banner | none | orange **TEST ENVIRONMENT** banner |
+
+Each web app's identity can only reach its own database, so nothing done in test can change production data. Sign-in and the people who can use it are the same for both. The app on a local computer uses the test database by default (see `.streamlit/secrets.toml`; it shows the TEST banner).
+
+### Workflow
+
+1. Work on the `test` branch: `git switch test`, make and commit changes, `git push`.
+2. Deploy to test and try it: `./deploy.sh test`.
+3. When it's right, merge into production: `git switch main && git merge test && git push`.
+4. Deploy production: `./deploy.sh production` (it refuses unless you're on an up-to-date `main`).
+
+If a change adds database columns, the first time it runs it adds them to that environment's database, so test gets them first.
+
+### Refresh test data from production
+
+To start test over with a fresh copy of production data (this replaces everything in the test database):
 
 ```bash
-git ls-files | zip -q /tmp/deploy.zip -@ && az webapp deploy -g rg-contact-scraper -n contact-scraper-4b54ea --src-path /tmp/deploy.zip --type zip
+.venv/bin/python refresh_test_db.py
 ```
+
+### Deploy an update
+
+`./deploy.sh test` or `./deploy.sh production` (needs `az login`). It deploys exactly what is committed, not unsaved edits.
 
 Azure installs `requirements.txt` during the deploy. App settings (`AZURE_SQL_SERVER`, `AZURE_SQL_DATABASE`, the sign-in secret) live in the web app's configuration, not in the repo.
 
@@ -159,7 +186,9 @@ Install spaCy and its English model; the scraper uses it automatically when pres
 
 ## Files
 
-- `app.py`: entry point and page navigation
+- `app.py`: entry point, page navigation and the TEST banner
+- `deploy.sh`: deploys the committed code to the test or production web app
+- `refresh_test_db.py`: replaces the test database's records with a copy of production's
 - `scraper_page.py`: scraper UI (spreadsheet + URL modes, progress, results, exports, save to Azure SQL)
 - `viewer_page.py`: Database viewer (browse, filter, sort, edit, add, delete, rescan, email check, export)
 - `rescan.py`: rescans selected records and fills only their missing fields
