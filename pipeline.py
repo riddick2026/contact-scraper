@@ -151,9 +151,11 @@ def _run(cfg, run_id: int, params: ScanParams, state: RunState, discover: bool) 
                              f" in {', '.join(area.labels) or 'all of WA'}", force=True)
             items = discovery.discover_lni(trades, area, log=lambda m: _log(cfg, state, m))
             _log(cfg, state, f"Stage 1: discovered {len(items)} unique businesses (duplicates across trades/areas merged)")
-            new, matched = db.merge_discovered(cfg, run_id, items, limit=params.max_new)
+            new, matched, fresh = db.merge_discovered(cfg, run_id, items, limit=params.max_new)
             skipped = max(0, len(items) - matched - new)
-            _log(cfg, state, f"Stage 1: {new} new records added, {matched} already in the database (gaps filled)"
+            _log(cfg, state, f"Stage 1: {new} new records added, {matched} already in the database (gaps filled"
+                             + (f"; {fresh} deep-dived in the last {db.REDIVE_AFTER_DAYS} days, not crawled again"
+                                if fresh else "") + ")"
                              + (f", {skipped} not added (limit of {params.max_new} new per scan)" if skipped else ""),
                  force=True)
             db.update_run(cfg, run_id, Discovered=len(items), NewRecords=new)
@@ -168,6 +170,8 @@ def _run(cfg, run_id: int, params: ScanParams, state: RunState, discover: bool) 
                        for r in records}
             for fut in as_completed(futures):
                 rec = futures[fut]
+                if fut.cancelled():
+                    continue  # never started: stays Pending for a later resume
                 try:
                     fields, note = fut.result()
                 except Exception as exc:  # noqa: BLE001 - one bad record never stops the batch
@@ -194,8 +198,11 @@ def _run(cfg, run_id: int, params: ScanParams, state: RunState, discover: bool) 
 
         counts = db.run_counts(cfg, run_id)
         status = "Cancelled" if state.cancel.is_set() else "Completed"
-        _log(cfg, state, f"{status}: {counts['done']} of {counts['total']} records deep-dived; "
-                         f"{counts['primary']} in Primary, {counts['secondary']} in Secondary", force=True)
+        left = counts["total"] - counts["done"]
+        _log(cfg, state, f"{status}: {state.done} records deep-dived this run"
+                         + (f", {left} still pending (resume to finish)" if left else "")
+                         + f". This scan's {counts['total']} businesses: {counts['primary']} in Primary, "
+                           f"{counts['secondary']} in Secondary", force=True)
         db.update_run(cfg, run_id, Status=status, FinishedAt=datetime.now(timezone.utc).replace(tzinfo=None),
                       Enriched=counts["done"], PrimaryCount=counts["primary"], SecondaryCount=counts["secondary"])
     except Exception as exc:  # noqa: BLE001

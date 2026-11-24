@@ -739,20 +739,25 @@ def _phone_keys(value) -> set[str]:
     return {d[-10:] for d in (re.sub(r"\D", "", p) for p in re.split(r"[,;/]", str(value or ""))) if len(d) >= 10}
 
 
-def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None = None) -> tuple[int, int]:
+REDIVE_AFTER_DAYS = 30  # existing records deep-dived more recently than this aren't crawled again
+
+
+def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None = None) -> tuple[int, int, int]:
     """Add discovered businesses, merging with existing records (same UBI, name or phone).
 
-    Existing records only get empty fields filled; everything touched is queued for the deep dive
-    (EnrichmentStatus = 'Pending', ScanRunId = run). Returns (new records, matched existing).
+    Existing records only get empty fields filled. New records, and existing ones not deep-dived in
+    the last REDIVE_AFTER_DAYS days, are queued for the deep dive (EnrichmentStatus = 'Pending');
+    all are tagged with the run. Returns (new, matched existing, matched but recently deep-dived).
     `limit` caps how many *new* records are added.
     """
     conn = connect(cfg)
     try:
         cur = conn.cursor()
         cur.execute("SELECT Id, VendorName, Phone, UBI, VendorType, ContactName, Address, City, Zip, Region, "
-                    "State FROM dbo.Vendors")
+                    f"State, CASE WHEN EnrichedAt > DATEADD(day, -{REDIVE_AFTER_DAYS}, SYSUTCDATETIME()) "
+                    "THEN 1 ELSE 0 END FROM dbo.Vendors")
         cols = ["Id", "VendorName", "Phone", "UBI", "VendorType", "ContactName", "Address", "City", "Zip",
-                "Region", "State"]
+                "Region", "State", "Fresh"]
         existing = [dict(zip(cols, r)) for r in cur.fetchall()]
         by_ubi = {e["UBI"]: e for e in existing if e["UBI"]}
         by_name = {_name_key(e["VendorName"]): e for e in existing if e["VendorName"]}
@@ -787,8 +792,11 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
                 })
                 by_name[_name_key(it.name)] = {"Id": None}  # avoid duplicate inserts within this batch
 
+        fresh_ids = {e["Id"] for e in existing if e["Fresh"]}
         for rec_id, fill in updates:
-            fill.update(ScanRunId=run_id, EnrichmentStatus="Pending")
+            fill["ScanRunId"] = run_id
+            if rec_id not in fresh_ids:
+                fill["EnrichmentStatus"] = "Pending"
             cur.execute(f"UPDATE dbo.Vendors SET {', '.join(f'{c} = ?' for c in fill)} WHERE Id = ?",
                         [*fill.values(), rec_id])
         if inserts:
@@ -798,7 +806,7 @@ def merge_discovered(cfg: DbConfig, run_id: int, items: list, limit: int | None 
                 f"WHERE NOT EXISTS (SELECT 1 FROM dbo.Vendors WHERE RecordKey = ?)",
                 [[r[c] for c in cols] + [r["RecordKey"]] for r in inserts])
         conn.commit()
-        return len(inserts), len(updates)
+        return len(inserts), len(updates), sum(1 for rec_id, _ in updates if rec_id in fresh_ids)
     except Exception as exc:  # noqa: BLE001
         conn.rollback()
         raise DbError(_friendly(exc)) from exc
