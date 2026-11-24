@@ -20,7 +20,11 @@ if is_test:
         unsafe_allow_html=True,
     )
 
-st.navigation([
+page = st.navigation([
     st.Page("scan_page.py", title="Scan", icon="🛰️", default=True),
     st.Page("viewer_page.py", title="Database viewer", icon="🗂️"),
-]).run()
+])
+# Lets a page tell "just switched here" apart from reruns caused by clicks on it
+st.session_state.page_entered = st.session_state.get("current_page") != page.title
+st.session_state.current_page = page.title
+page.run()

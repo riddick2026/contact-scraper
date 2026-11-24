@@ -451,6 +451,17 @@ class ChangeResult:
     conflicts: list[str] | None = None  # rows changed by someone else since loading
 
 
+def data_version(cfg: DbConfig) -> tuple:
+    """A cheap fingerprint of dbo.Vendors (row count and newest row version): changes whenever any record does."""
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), CONVERT(BIGINT, MAX(RowVer)) FROM dbo.Vendors")
+        return tuple(cur.fetchone())
+    finally:
+        conn.close()
+
+
 def load_vendors(cfg: DbConfig, scan_run_id: int | None = None) -> tuple[pd.DataFrame, dict[int, bytes]]:
     """Saved records (all, or those from one scan), newest activity first, plus each row's version stamp by Id."""
     conn = connect(cfg)

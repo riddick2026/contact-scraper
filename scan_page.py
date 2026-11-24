@@ -126,14 +126,16 @@ with st.container(border=True):
                                  placeholder="e.g. Spokane, Camas, 98604, 993" if scan_state == "WA" else
                                  "City names or ZIPs, comma-separated",
                                  help="City names, 5-digit ZIPs, or 3-digit ZIP prefixes, separated by commas.")
-    critical = st.multiselect(
+    k1, k2 = st.columns([3, 1])
+    critical = k1.multiselect(
         "Critical fields (a record needs all of these to be in the Primary queue)",
         list(routing.CRITICAL_FIELDS), default=prev.get("critical", saved_critical),
         help="'Valid email' means an email that passed the email check (not just present).")
+    max_new = k2.number_input("Max new businesses", 1, 3000, int(prev.get("max_new", 100)),
+                              help="The most new records this scan will add; it stops discovering once it has this "
+                                   "many. Each takes ~5-15 s to deep-dive. Remembered from your last scan.")
     with st.expander("Advanced"):
-        a1, a2, a3 = st.columns(3)
-        max_new = a1.number_input("Max new businesses per scan", 1, 3000, int(prev.get("max_new", 100)),
-                                  help="Caps how many new records one scan adds. Each takes ~5-15 s to deep-dive.")
+        a2, a3 = st.columns(2)
         workers = a2.number_input("Sites crawled at once", 1, 12, int(prev.get("workers", 6)))
         max_pages = a3.number_input("Pages per site", 1, 12, int(prev.get("max_pages", 6)))
         brave_key = st.text_input("Brave Search API key (optional)", type="password",
@@ -153,7 +155,8 @@ with st.container(border=True):
                     + (f"  \nAbout **{total}** active licenses (before merging duplicates and records you already "
                        f"have)." if total else "")
                     + (" Web search finds an unknown number in advance." if web else "")
-                    + f"  \nThis scan adds up to **{expect}** new businesses; at ~10 s each with {workers} at a time, "
+                    + f"  \nThis scan adds up to **{expect}** new businesses (your **Max new businesses** setting"
+                      f"{' caps it' if total > max_new or web else ''}); at ~10 s each with {workers} at a time, "
                       f"roughly **{max(1, round(expect * 10 / workers / 60))} min**"
                     + (" (plus a few minutes of web searching)." if web else "."))
         except Exception as exc:  # noqa: BLE001

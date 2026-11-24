@@ -34,8 +34,9 @@ DEFAULT_SORT = "Last activity"
 
 def load() -> None:
     with st.spinner("Loading records… (a paused database can take up to a minute to wake)"):
+        version = db.data_version(cfg)
         df, versions = db.load_vendors(cfg)
-    st.session_state.viewer = {"df": df, "versions": versions, "loaded": datetime.now()}
+    st.session_state.viewer = {"df": df, "versions": versions, "loaded": datetime.now(), "version": version}
     st.session_state.viewer_token = st.session_state.get("viewer_token", 0) + 1
 
 
@@ -91,6 +92,15 @@ if "viewer" not in st.session_state:
         if st.button("Try again"):
             st.rerun()
         st.stop()
+
+elif st.session_state.get("page_entered", True):
+    # Coming back from another page (e.g. after a scan): refresh if any record changed meanwhile.
+    # Only on arrival, so edits in progress on this page are never discarded.
+    try:
+        if db.data_version(cfg) != st.session_state.viewer.get("version"):
+            load()
+    except db.DbError as exc:
+        st.warning(f"Couldn't check for new data ({exc}); showing what was loaded earlier.")
 
 data = st.session_state.viewer
 df_all: pd.DataFrame = data["df"]
