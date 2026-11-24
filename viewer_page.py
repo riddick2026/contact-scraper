@@ -103,12 +103,16 @@ def find_changes(before: pd.DataFrame, after: pd.DataFrame) -> tuple[dict[int, d
     return updates, inserts, deletes
 
 
-def multiselect_filter(container, label: str, series: pd.Series) -> list[str]:
-    options = sorted({NONE_LABEL if pd.isna(v) or v == "" else str(v) for v in series})
-    return container.multiselect(label, options, default=options)
+def multiselect_filter(container, label: str, series: pd.Series, known: list[str] | None = None) -> list[str]:
+    """A filter that starts empty; empty means "all". Offers every known value plus any others in the data."""
+    present = {NONE_LABEL if pd.isna(v) or v == "" else str(v) for v in series}
+    options = list(known or []) + sorted(present - set(known or []))
+    return container.multiselect(label, options, default=[], placeholder="All")
 
 
 def in_choices(series: pd.Series, chosen: list[str]) -> pd.Series:
+    if not chosen:  # nothing picked: don't filter on this field
+        return pd.Series(True, index=series.index)
     return series.fillna(NONE_LABEL).replace("", NONE_LABEL).astype(str).isin(chosen)
 
 
@@ -238,13 +242,12 @@ SORTABLE = {DEFAULT_SORT: None, **{COLUMN_CONFIG[c]["label"]: c for c in db.VIEW
 f1, f2, f3 = st.columns([2, 1.3, 1.3])
 search = f1.text_input("Search", placeholder="Vendor, email, phone, website, notes…")
 show = f2.selectbox("Show", list(FILTERS))
-sources = sorted(df_all["Source"].dropna().unique())
-picked = f3.multiselect("Added from", sources, default=sources)
+picked = multiselect_filter(f3, "Added from", df_all["Source"])
 
 g1, g2, g3 = st.columns(3)
-picked_types = multiselect_filter(g1, "Vendor type", df_all["VendorType"])
-picked_onboarded = multiselect_filter(g2, "Onboarded", df_all["Onboarded"])
-picked_liability = multiselect_filter(g3, "Liability insurance", df_all["LiabilityInsurance"])
+picked_types = multiselect_filter(g1, "Vendor type", df_all["VendorType"], enrich.VENDOR_TYPES)
+picked_onboarded = multiselect_filter(g2, "Onboarded", df_all["Onboarded"], db.ONBOARDED_VALUES)
+picked_liability = multiselect_filter(g3, "Liability insurance", df_all["LiabilityInsurance"], db.LIABILITY_VALUES)
 
 s1, s2, s3 = st.columns([2, 1, 1.6], vertical_alignment="bottom")
 sort_label = s1.selectbox("Sort by", list(SORTABLE))
@@ -252,7 +255,7 @@ descending = s2.toggle("Descending", value=sort_label == DEFAULT_SORT)
 select_all = s3.checkbox("Select all shown", help="Tick every record in the current view (for rescan or email check)")
 
 view = FILTERS[show](df_all)
-view = view[view["Source"].isin(picked) & in_choices(view["VendorType"], picked_types)
+view = view[in_choices(view["Source"], picked) & in_choices(view["VendorType"], picked_types)
             & in_choices(view["Onboarded"], picked_onboarded) & in_choices(view["LiabilityInsurance"], picked_liability)]
 if search.strip():
     text = view[["VendorName", "VendorType", "State", "Website", "ContactName", "Email", "Phone", "InsuranceOrBond",
